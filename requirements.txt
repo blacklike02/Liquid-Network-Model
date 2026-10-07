@@ -1,0 +1,11 @@
+torch>=2.1
+numpy
+
+# Опционально (см. README):
+# tokenizers            # BPE-токенизатор
+# pandas
+# pyarrow               # .csv / .parquet
+# charset-normalizer    # автоопределение кодировки
+# tensorboard           # --log-backend tensorboard
+# wandb                 # --log-backend wandb
+# triton                # --kernel triton (Linux + CUDA)

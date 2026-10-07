@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Обучение: чекпоинты, логи, данные
+*.pt
+*.pth
+runs/
+wandb/
+data/
+tokenizer*.json
+
+# Редакторы / ОС
+.idea/
+.vscode/
+.DS_Store
