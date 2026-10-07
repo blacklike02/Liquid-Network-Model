@@ -49,4 +49,4 @@ Include the command used to run the program, the complete traceback, Python /
 PyTorch / CUDA versions, and, if possible, a minimal reproducible example.
 
 By submitting a contribution, you agree that it will be distributed under the
-project license (MIT).
+project license (Apache License 2.0).
