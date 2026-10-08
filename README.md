@@ -2,11 +2,13 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
-A single-file autoregressive language model implemented with **Liquid Neural
+An autoregressive language model implemented with **Liquid Neural
 Networks** (Liquid Time-Constant and Closed-form Continuous-time) in PyTorch.
-The entire project is contained in `liquid_text_model.py`: corpus loading and
-cleaning, tokenizers, the model, training, generation, chat, and supporting
-utilities.
+The code lives in the `liquid_lm` package: corpus loading and cleaning,
+tokenizers, the model, training, generation, chat, and supporting utilities.
+Everything is launched through the thin entry point `liquid_text_model.py`
+(or `python -m liquid_lm`), so all commands in this document work from the
+repository root.
 
 Instead of self-attention, the model processes text recurrently: each layer's
 hidden state evolves as a dynamical system with learnable time constants. This
@@ -128,7 +130,7 @@ pip install tensorboard wandb
 Check that the GPU is visible:
 
 ```bash
-python liquid_text_model.py --info --checkpoint несуществует.pt   # prints Device/GPU/VRAM, then reports the checkpoint error
+python liquid_text_model.py --info --checkpoint nonexistent.pt   # prints Device/GPU/VRAM, then reports the checkpoint error
 ```
 
 At startup the program prints the device, PyTorch version, GPU name, VRAM,
@@ -639,7 +641,7 @@ The prompt is wrapped in `<|user|>\n…\n<|bot|>\n`. Generation stops at
 python liquid_text_model.py --chat-repl
 ```
 
-An empty line, `exit`, `quit`, `q`, or `выход` exits. Dialogue history is stored
+An empty line, `exit`, `quit`, or `q` exits. Dialogue history is stored
 as text and truncated to `--chat-history-chars` (default 4000) at a turn
 boundary.
 
@@ -1026,27 +1028,64 @@ The model is recurrent, so the time loop is sequential:
 
 ## Code structure
 
-Everything is in `liquid_text_model.py`:
+```
+liquid_text_model.py          # thin entry point: python liquid_text_model.py ...
+liquid_lm/
+├── __init__.py               # sets PYTORCH_CUDA_ALLOC_CONF before torch is imported
+├── __main__.py               # python -m liquid_lm ...
+├── cli.py                    # main(): argument validation and mode dispatch
+├── args.py                   # build_parser()
+├── constants.py              # supported suffixes, excluded dirs, text encodings
+├── device.py                 # set_seed, choose_device, configure_tensor_cores,
+│                             #   print_device_info, cuda_memory_report
+├── checkpoint.py             # save_checkpoint, load_checkpoint_raw,
+│                             #   print_checkpoint_info, set_trust_checkpoints
+├── train_logger.py           # TrainLogger (TensorBoard / Weights & Biases)
+├── inference.py              # run_generate_only, run_chat_repl
+├── selftest.py               # selftest_triton_tail
+├── data/
+│   ├── tags.py               # dialogue tags, role and question-answer key tables
+│   ├── readers.py            # clean_text, dialogue_obj_to_text, json_to_text,
+│   │                         #   jsonl_to_text, table readers, read_text_robust
+│   ├── corpus.py             # load_texts
+│   ├── tokenization.py       # CharTokenizer, BPETokenizer, build_tokenizer,
+│   │                         #   tokenizer_from_checkpoint
+│   └── batching.py           # get_batch, build_dialogue_anchors, build_train_mask
+├── model/
+│   ├── liquid_lm.py          # LiquidLanguageModel (including generate)
+│   ├── liquid_cell.py        # LiquidCell (ltc / cfc gates, dense / ncp wiring)
+│   ├── ncp.py                # NCPRecurrent
+│   ├── chunk_memory.py       # ChunkMemory and the chunk_memory_* helpers
+│   ├── triton_kernel.py      # _ltc_tail_kernel and its wrapper
+│   ├── dropout.py            # LockedDropout
+│   ├── ema.py                # EMA
+│   ├── config.py             # ARCH_KEYS, LEGACY_ARCH_DEFAULTS,
+│   │                         #   create_model_from_config, load_model_state_compat
+│   └── utils.py              # get_base_model, detach_hidden, EMA/backup helpers
+└── training/
+    ├── trainer.py            # run_training
+    ├── evaluate.py           # evaluate
+    ├── optim.py              # Muon, MuonAdamWHybrid, MultiScheduler,
+    │                         #   make_scheduler, make_optimizer
+    ├── losses.py             # masked_cross_entropy
+    └── amp.py                # resolve_amp_dtype, make_grad_scaler, autocast_context
+```
 
-| Block | Contents |
-|---|---|
-| Utilities | `set_seed`, `choose_device`, `configure_tensor_cores`, `print_device_info`, `TrainLogger` |
-| Data | `clean_text`, `dialogue_obj_to_text`, `json_to_text`, `jsonl_to_text`, `_dataframe_to_text`, `read_text_robust`, `load_texts` |
-| Kernels | `LockedDropout`, Triton kernel `_ltc_tail_kernel` and wrapper |
-| Model | `NCPRecurrent`, `LiquidCell`, `ChunkMemory`, `LiquidLanguageModel` (including `generate`) |
-| Tokenizers | `CharTokenizer`, `BPETokenizer`, `build_tokenizer`, `tokenizer_from_checkpoint` |
-| Batches | `get_batch`, `build_dialogue_anchors`, `build_train_mask`, `masked_cross_entropy` |
-| Training | `EMA`, `evaluate`, `Muon`, `MuonAdamWHybrid`, `MultiScheduler`, `make_scheduler`, `make_optimizer`, `run_training` |
-| Checkpoints | `save_checkpoint`, `load_checkpoint_raw`, `create_model_from_config`, `load_model_state_compat` |
-| Modes | `run_generate_only`, `run_chat_repl`, `selftest_triton_tail`, `main` |
+Run all commands from the repository root. The optional dependencies
+(`pandas`, `charset-normalizer`, `tokenizers`, `tensorboard`, `wandb`,
+`triton`) are imported with a fallback in the module that uses them, so a
+missing package never breaks unrelated parts of the program.
 
 ### Adding a custom architecture option
 
-1. Add the argument to `build_parser()`.
-2. Pass it to `LiquidLanguageModel` / `LiquidCell`.
+1. Add the argument to `build_parser()` in `liquid_lm/args.py`.
+2. Implement it in `LiquidLanguageModel` / `LiquidCell`
+   (`liquid_lm/model/`), and pass it through where the model is built in
+   `run_training` (`liquid_lm/training/trainer.py`).
 3. Add its key to `ARCH_KEYS` and a default for old checkpoints to
-   `LEGACY_ARCH_DEFAULTS`, so `--resume` and old files remain compatible.
-4. Pass the parameter to `create_model_from_config`.
+   `LEGACY_ARCH_DEFAULTS` in `liquid_lm/model/config.py`, so `--resume` and
+   old files remain compatible.
+4. Pass the parameter to `create_model_from_config` (same file).
 
 ## Change history
 
