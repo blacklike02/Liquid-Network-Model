@@ -3,6 +3,13 @@
 Thank you for your interest in the project! Changes, ideas, and experiment
 results are welcome.
 
+## Project layout
+
+The code lives in the `liquid_lm` package (`model/`, `data/`, `training/`, plus
+the CLI and inference modules), launched through the thin entry point
+`liquid_text_model.py`. See the "Code structure" section of the README for a
+file-by-file map. Run all commands from the repository root.
+
 ## Most useful contributions right now
 
 1. **A/B benchmarks.** The `cfc`, `ncp`, `--memory-slots`, `--ode-solver heun`,
@@ -10,10 +17,13 @@ results are welcome.
    `ltc + euler + dense`. Running two configurations on the same data with the
    same `--seed`, then comparing `val loss` and speed, would be especially
    valuable. Please include the commands used, hardware, and PyTorch version.
-2. **Tests.** There are currently no automated tests. Unit tests are especially
-   needed for the cell mathematics: equivalence between `_ltc_step` and the
-   Triton tail, equivalence between block-based `NCPRecurrent` and a dense
-   matrix with zero blocks, and the FIFO behavior of `ChunkMemory`.
+2. **Tests.** There are currently no automated tests (a top-level `tests/`
+   directory would be a good home for them). Unit tests are especially needed
+   for the cell mathematics: equivalence between `_ltc_step` and the Triton
+   tail (`liquid_lm/model/liquid_cell.py`, `liquid_lm/model/triton_kernel.py`),
+   equivalence between block-based `NCPRecurrent` and a dense matrix with zero
+   blocks (`liquid_lm/model/ncp.py`), and the FIFO behavior of `ChunkMemory`
+   (`liquid_lm/model/chunk_memory.py`).
 3. **Testing on other hardware and PyTorch versions**, especially
    `--kernel triton` and `--compile`.
 4. **Ideas from the list below.**
@@ -28,7 +38,6 @@ results are welcome.
 - Using `ChunkMemory` in `generate()` and chat.
 - Batched generation.
 - Hybrid liquid layers with a small number of attention blocks.
-- Splitting the single file into a package (model / data / training / CLI).
 
 ## How to propose a change
 
@@ -37,7 +46,9 @@ results are welcome.
 2. Fork the repository and create a separate branch from `main`.
 3. Preserve backward compatibility: new options should be **disabled** by
    default, and architecture parameters must be added to `ARCH_KEYS` /
-   `LEGACY_ARCH_DEFAULTS` so that old checkpoints continue to load.
+   `LEGACY_ARCH_DEFAULTS` (in `liquid_lm/model/config.py`) so that old
+   checkpoints continue to load. The README section "Adding a custom
+   architecture option" lists every place that needs to change.
 4. In the Pull Request, state what changed, why, and how it was tested
    (command and result). If you claim a speed or quality improvement, include
    measurements.

@@ -1,11 +1,20 @@
-torch>=2.1
+# Liquid LM — dependencies. Python 3.9+.
+#
+# For GPU training, install PyTorch first using the command from
+# https://pytorch.org for your CUDA version, then run:
+#     pip install -r requirements.txt
+
+# --- Required ---
+torch>=2.0
 numpy
 
-# Опционально (см. README):
-# tokenizers            # BPE-токенизатор
-# pandas
-# pyarrow               # .csv / .parquet
-# charset-normalizer    # автоопределение кодировки
-# tensorboard           # --log-backend tensorboard
-# wandb                 # --log-backend wandb
-# triton                # --kernel triton (Linux + CUDA)
+# --- Recommended for real work ---
+tokenizers          # BPE tokenizer (without it the program falls back to char)
+pandas              # .csv / .tsv / .parquet as tables
+pyarrow             # .parquet support for pandas
+charset-normalizer  # accurate text-file encoding detection
+
+# --- Optional (uncomment if needed) ---
+# tensorboard       # --log-backend tensorboard
+# wandb             # --log-backend wandb (run `wandb login` once)
+# triton            # --kernel triton (Linux + NVIDIA GPU, inference only)
