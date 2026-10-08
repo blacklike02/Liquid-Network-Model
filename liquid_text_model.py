@@ -3030,8 +3030,6 @@ def main():
         raise ValueError("--dropout must be in [0, 1)")
     if not 0.0 <= args.zoneout < 1.0:
         raise ValueError("--zoneout must be in [0, 1)")
-    # При --resume архитектуру диктует чекпоинт (см. run_training), поэтому
-    # проверку по CLI-значениям делаем только для нового обучения.
     if not args.resume and args.tie_weights and args.embedding_dim != args.hidden_size:
         raise ValueError("--tie-weights requires --embedding-dim == --hidden-size")
     if args.ema_decay != 0 and not 0.8 <= args.ema_decay < 1.0:
