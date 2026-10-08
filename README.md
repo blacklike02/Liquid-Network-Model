@@ -323,12 +323,12 @@ Embedding ──► LockedDropout
   ▼
 ┌──────────────── for each step t ───────────────────┐
 │  layer 1: LiquidCell(h1, x_t) ──► h1'              │
-│  x = x + h1'     (residual, if enabled)             │
-│  layer 2: LiquidCell(h2, x)  ──► h2'              │
-│  x = x + h2'                                        │
-│  ...                                                │
-│  final LayerNorm(x)                                 │
-└─────────────────────────────────────────────────────┘
+│  x = x + h1'     (residual, if enabled)            │
+│  layer 2: LiquidCell(h2, x)  ──► h2'               │
+│  x = x + h2'                                       │
+│  ...                                               │
+│  final LayerNorm(x)                                │
+└────────────────────────────────────────────────────┘
   │
   ▼
 Readout (Linear or MLP head; weights may be tied to Embedding)
