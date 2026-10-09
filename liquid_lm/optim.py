@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from ..model.utils import get_base_model
+from .model import get_base_model
 
 
 def _zeropower_via_newton_schulz5(G, steps):
@@ -126,13 +126,39 @@ class MultiScheduler:
             sch.load_state_dict(st)
 
 
-def make_scheduler(optimizer, total_steps, warmup_steps, min_lr_ratio):
+def make_scheduler(
+    optimizer, total_steps, warmup_steps, min_lr_ratio,
+    stage_split_step=None, stage_lr_ratio=0.3,
+):
+    """Warmup + cosine decay.
+
+    With stage_split_step (the update index where the long-context stage
+    starts) the schedule has two phases:
+      1. warmup, then cosine from 1.0 down to stage_lr_ratio, reached exactly
+         at stage_split_step;
+      2. an accelerated linear decay from stage_lr_ratio to min_lr_ratio over
+         the remaining updates (the long-context stage).
+    Without it (None) the schedule is the plain single cosine."""
     total_steps = max(total_steps, 1)
     warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+    two_phase = stage_split_step is not None and 0 < stage_split_step < total_steps
+    if two_phase:
+        split = int(stage_split_step)
+        warmup_steps = max(0, min(warmup_steps, split - 1))
+        stage_ratio = min(1.0, max(float(stage_lr_ratio), float(min_lr_ratio)))
 
     def lr_lambda(step):
         if step < warmup_steps:
             return max(step + 1, 1) / max(warmup_steps, 1)
+        if two_phase:
+            if step < split:
+                progress = (step - warmup_steps) / max(split - warmup_steps, 1)
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return stage_ratio + (1.0 - stage_ratio) * cosine
+            progress = (step - split) / max(total_steps - split, 1)
+            progress = min(max(progress, 0.0), 1.0)
+            return stage_ratio + (min_lr_ratio - stage_ratio) * progress
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         progress = min(max(progress, 0.0), 1.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))

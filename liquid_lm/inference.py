@@ -5,11 +5,15 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from .checkpoint import load_checkpoint_raw, print_checkpoint_info
-from .data.tags import BOT_TAG, EXAMPLE_END_TAG, USER_TAG
-from .data.tokenization import default_stop_ids, tokenizer_from_checkpoint
-from .device import cuda_memory_report
-from .model.config import create_model_from_config, load_model_state_compat
+from .data import BOT_TAG, EXAMPLE_END_TAG, USER_TAG
+from .model import (
+    create_model_from_config,
+    load_checkpoint_raw,
+    load_model_state_compat,
+    print_checkpoint_info,
+)
+from .tokenizer import default_stop_ids, tokenizer_from_checkpoint
+from .utils import cuda_memory_report
 
 
 def run_chat_repl(args, device):
