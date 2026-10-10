@@ -14,7 +14,7 @@ Time-Constant и Closed-form Continuous-time) на PyTorch. Код органи�
 константами. Это даёт память фиксированного размера и стоимость генерации,
 линейную по длине последовательности.
 
-> Текущая версия: **v3.6**. История изменений — в конце документа.
+> Текущая версия: **v3.7**. История изменений — в конце документа.
 
 ## Содержание
 
@@ -1042,46 +1042,25 @@ BPE-токенизатор v3.6 отличается от прежних вер�
 ## Структура кода
 
 ```
-liquid_text_model.py          # тонкая точка входа: python liquid_text_model.py ...
+liquid_text_model.py          # тонкая точка входа командной строки
 liquid_lm/
-├── __init__.py               # выставляет PYTORCH_CUDA_ALLOC_CONF до импорта torch
-├── __main__.py               # python -m liquid_lm ...
-├── cli.py                    # main(): проверка аргументов и выбор режима
-├── args.py                   # build_parser()
-├── constants.py              # поддерживаемые расширения, исключаемые папки, кодировки
-├── device.py                 # set_seed, choose_device, configure_tensor_cores,
-│                             #   print_device_info, cuda_memory_report
-├── checkpoint.py             # save_checkpoint, load_checkpoint_raw,
-│                             #   print_checkpoint_info, set_trust_checkpoints
-├── train_logger.py           # TrainLogger (TensorBoard / Weights & Biases)
-├── inference.py              # run_generate_only, run_chat_repl
-├── selftest.py               # selftest_triton_tail
-├── data/
-│   ├── tags.py               # теги диалогов, таблицы ролей и ключей «вопрос-ответ»
-│   ├── readers.py            # clean_text, dialogue_obj_to_text, json_to_text,
-│   │                         #   jsonl_to_text, чтение таблиц, read_text_robust
-│   ├── corpus.py             # load_texts
-│   ├── tokenization.py       # CharTokenizer, BPETokenizer, build_tokenizer,
-│   │                         #   tokenizer_from_checkpoint
-│   └── batching.py           # get_batch, build_dialogue_anchors, build_train_mask
-├── model/
-│   ├── liquid_lm.py          # LiquidLanguageModel (включая generate)
-│   ├── liquid_cell.py        # LiquidCell (вентили ltc / cfc, проводка dense / ncp)
-│   ├── ncp.py                # NCPRecurrent
-│   ├── chunk_memory.py       # ChunkMemory и функции chunk_memory_*
-│   ├── triton_kernel.py      # _ltc_tail_kernel и его обёртка
-│   ├── dropout.py            # LockedDropout
-│   ├── ema.py                # EMA
-│   ├── config.py             # ARCH_KEYS, LEGACY_ARCH_DEFAULTS,
-│   │                         #   create_model_from_config, load_model_state_compat
-│   └── utils.py              # get_base_model, detach_hidden, копии весов для EMA
-└── training/
-    ├── trainer.py            # run_training
-    ├── evaluate.py           # evaluate
-    ├── optim.py              # Muon, MuonAdamWHybrid, MultiScheduler,
-    │                         #   make_scheduler, make_optimizer
-    ├── losses.py             # masked_cross_entropy
-    └── amp.py                # resolve_amp_dtype, make_grad_scaler, autocast_context
+├── __init__.py               # настройка окружения до импорта torch
+├── __main__.py               # python -m liquid_lm
+├── cli.py                    # CLI, проверка аргументов и выбор режима
+├── data.py                   # чтение и очистка корпуса, FIM и разбор диалогов
+├── inference.py              # генерация и интерактивный чат
+├── layers.py                 # liquid-ячейки, NCP, ChunkMemory и ядро Triton
+├── model.py                  # LiquidLanguageModel, генерация и чекпоинты
+├── optim.py                  # AdamW, Muon и планировщики скорости обучения
+├── tokenizer.py              # посимвольный и byte-level BPE-токенизаторы
+├── training.py               # батчи, loss, AMP, EMA, оценка и обучение
+└── utils.py                  # устройство, seed и логирование
+requirements.txt              # зависимости Python
+
+tests/
+└── test_regressions.py       # регрессионные тесты из этого аудита
+.github/workflows/
+└── tests.yml                 # запуск тестов на CPU
 ```
 
 Все команды запускаются из корня репозитория. Необязательные зависимости
@@ -1091,18 +1070,18 @@ liquid_lm/
 
 ### Добавление своей архитектурной опции
 
-1. Добавь аргумент в `build_parser()` в `liquid_lm/args.py`.
-2. Реализуй его в `LiquidLanguageModel` / `LiquidCell` (`liquid_lm/model/`) и
-   передай там, где модель создаётся в `run_training`
-   (`liquid_lm/training/trainer.py`).
-3. Добавь ключ в `ARCH_KEYS`, а значение по умолчанию для старых чекпоинтов в
-   `LEGACY_ARCH_DEFAULTS` в `liquid_lm/model/config.py`, чтобы `--resume` и
-   старые файлы остались совместимы.
-4. Передай параметр в `create_model_from_config` (тот же файл).
+1. Добавь аргумент в `build_parser()` в `liquid_lm/cli.py`.
+2. Реализуй его в `LiquidLanguageModel` / `LiquidCell` в `liquid_lm/model.py`
+   и `liquid_lm/layers.py`, затем передай параметр в `run_training`
+   из `liquid_lm/training.py`.
+3. Добавь ключ в `ARCH_KEYS`, а значение по умолчанию для старых чекпоинтов
+   в `LEGACY_ARCH_DEFAULTS` в `liquid_lm/model.py`, чтобы `--resume` и старые
+   чекпоинты остались совместимыми.
+4. Передай параметр в `create_model_from_config` в `liquid_lm/model.py`.
 
 ## История изменений
 
-Сейчас проект находится на версии **v3.6**. Подробности о поведении, которое
+Сейчас проект находится на версии **v3.7**. Подробности о поведении, которое
 менялось между версиями, смотри в истории репозитория и в заметках о
 совместимости чекпоинтов выше.
 
