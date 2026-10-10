@@ -72,7 +72,7 @@ def get_batch(
     train_mask: torch.Tensor | None = None,
 ):
     max_start = split_end - seq_len - 1
-    if max_start <= split_start:
+    if max_start < split_start:
         raise ValueError("Not enough text for the selected seq_len and train/val split.")
     key = (str(data.device), seq_len)
     ar = _ARANGE_CACHE.get(key)
@@ -242,6 +242,19 @@ def autocast_context(device, amp_dtype):
     if amp_dtype is None:
         return torch.autocast(device_type=device.type, enabled=False)
     return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=True)
+
+
+def grad_scaler_step_succeeded(optimizer, scaler) -> bool:
+    """Run one scaled optimizer step and detect GradScaler overflow skips.
+
+    GradScaler lowers its scale when inf/NaN gradients cause it to skip the
+    optimizer update. The LR scheduler, global step counter and EMA must only
+    advance when the underlying optimizer actually updates the parameters.
+    """
+    scale_before = scaler.get_scale()
+    scaler.step(optimizer)
+    scaler.update()
+    return scaler.get_scale() >= scale_before
 
 
 # ---------------------------------------------------------------------------
@@ -701,15 +714,16 @@ def run_training(args, device):
                         model.parameters(), args.grad_clip
                     ).item()
                 if scaler is not None:
-                    scaler.step(optimizer)
-                    scaler.update()
+                    update_succeeded = grad_scaler_step_succeeded(optimizer, scaler)
                 else:
                     optimizer.step()
-                scheduler.step()
+                    update_succeeded = True
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                if ema is not None:
-                    ema.update(model)
+                if update_succeeded:
+                    scheduler.step()
+                    global_step += 1
+                    if ema is not None:
+                        ema.update(model)
 
             if step % max(1, args.steps_per_epoch // 5) == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
