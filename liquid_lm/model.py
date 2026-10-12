@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,6 +53,36 @@ def restore_float_state(model, backup):
     msd = get_base_model(model).state_dict()
     for k, v in backup.items():
         msd[k].copy_(v)
+
+
+def validate_generation_options(
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    repetition_window: int,
+) -> None:
+    """Fail early on invalid generation settings instead of silently ignoring them."""
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be >= 0")
+    if not math.isfinite(float(temperature)) or temperature <= 0:
+        raise ValueError("temperature must be finite and > 0")
+    if top_k < 0:
+        raise ValueError("top_k must be >= 0")
+    if not math.isfinite(float(top_p)) or not 0.0 <= top_p <= 1.0:
+        raise ValueError("top_p must be finite and between 0 and 1")
+    if not math.isfinite(float(repetition_penalty)) or repetition_penalty <= 0:
+        raise ValueError("repetition_penalty must be finite and > 0")
+    if repetition_window < 0:
+        raise ValueError("repetition_window must be >= 0")
+
+
+def _trim_recent_tokens(tokens: list[int], window: int) -> list[int]:
+    """A zero window disables repetition tracking; negative windows are invalid."""
+    if window < 0:
+        raise ValueError("repetition_window must be >= 0")
+    return list(tokens[-window:]) if window > 0 else []
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +474,14 @@ class LiquidLanguageModel(nn.Module):
         stop_token_ids: list[int] | None = None,
         only_new: bool = False,
     ) -> str:
+        validate_generation_options(
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+        )
         self.eval()
         if not prompt:
             prompt = " "
@@ -457,7 +496,7 @@ class LiquidLanguageModel(nn.Module):
         next_logits = logits_all[:, -1, :].float()
 
         generated_ids = list(prompt_ids)
-        recent_tokens = generated_ids[-repetition_window:]
+        recent_tokens = _trim_recent_tokens(generated_ids, repetition_window)
         temperature = max(float(temperature), 1e-4)
 
         for step_i in range(max_new_tokens):
@@ -472,8 +511,7 @@ class LiquidLanguageModel(nn.Module):
             if token_id in stop_ids:
                 break
             generated_ids.append(token_id)
-            recent_tokens.append(token_id)
-            recent_tokens = recent_tokens[-repetition_window:]
+            recent_tokens = _trim_recent_tokens(recent_tokens + [token_id], repetition_window)
             if step_i + 1 < max_new_tokens:
                 logits_all, hidden = self.forward(next_token, hidden=hidden, fused=fused)
                 next_logits = logits_all[:, -1, :].float()

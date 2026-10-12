@@ -60,6 +60,32 @@ _ARANGE_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 IGNORE_INDEX = -100
 
 
+def restore_resume_data_settings(args, saved_cfg: dict) -> None:
+    """Restore settings that define corpus order and the train/validation split."""
+    args.shuffle_files = bool(saved_cfg.get("shuffle_files", False))
+    args.file_headers = bool(saved_cfg.get("file_headers", True))
+    args.fim_rate = float(saved_cfg.get("fim_rate", 0.0) or 0.0)
+
+    if "val_split" in saved_cfg:
+        saved_val_split = float(saved_cfg["val_split"])
+        if float(args.val_split) != saved_val_split:
+            print(
+                f"[RESUME] val_split: {args.val_split} -> {saved_val_split} "
+                "(from checkpoint)"
+            )
+        args.val_split = saved_val_split
+
+
+def validate_training_targets(train_mask, split: int) -> None:
+    """Reject loss masks that leave the entire training split without targets."""
+    mask = np.asarray(train_mask, dtype=bool)
+    if split <= 1 or not mask[1:split].any():
+        raise ValueError(
+            "Loss masking excluded every target token from the training split. "
+            "Check the dialogue tags, --loss-mask, and --val-split."
+        )
+
+
 def get_batch(
     data: torch.Tensor,
     batch_size: int,
@@ -387,18 +413,16 @@ def run_training(args, device):
     bad_epochs = 0
     resume_payload = None
 
-    val_split = float(args.val_split)
-    if not 0.01 <= val_split <= 0.5:
-        raise ValueError("--val-split must be between 0.01 and 0.5")
-
     resume_tokenizer = None
     if args.resume:
         resume_payload = load_checkpoint_raw(last_checkpoint_path, device)
         saved_cfg = resume_payload["config"]
-        args.shuffle_files = bool(saved_cfg.get("shuffle_files", False))
-        args.file_headers = bool(saved_cfg.get("file_headers", True))
-        args.fim_rate = float(saved_cfg.get("fim_rate", 0.0) or 0.0)
+        restore_resume_data_settings(args, saved_cfg)
         resume_tokenizer = tokenizer_from_checkpoint(resume_payload)
+
+    val_split = float(args.val_split)
+    if not 0.01 <= val_split <= 0.5:
+        raise ValueError("--val-split must be between 0.01 and 0.5")
 
     fim_rate = float(args.fim_rate)
     if not 0.0 <= fim_rate <= 1.0:
@@ -482,6 +506,7 @@ def run_training(args, device):
     train_mask = None
     if args.loss_mask:
         train_mask_np = build_train_mask(encoded, tokenizer)
+        validate_training_targets(train_mask_np, split)
         if not train_mask_np.all():
             train_mask = torch.from_numpy(train_mask_np)
             if device.type == "cuda":

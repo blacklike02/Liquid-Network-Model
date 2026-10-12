@@ -1,18 +1,22 @@
 """Regression tests for Liquid-Network-Model's critical sequence paths."""
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
-from liquid_lm.cli import validate_eval_batches
-from liquid_lm.model import LiquidLanguageModel
+from liquid_lm.layers import RMSNorm
+from liquid_lm.cli import validate_eval_batches, validate_training_ranges
+from liquid_lm.model import LiquidLanguageModel, _trim_recent_tokens, validate_generation_options
 from liquid_lm.tokenizer import CharTokenizer
 from liquid_lm.training import (
     evaluate,
     get_batch,
     grad_scaler_step_succeeded,
     masked_cross_entropy,
+    restore_resume_data_settings,
     validate_distillation_tokenizers,
+    validate_training_targets,
 )
 
 
@@ -94,11 +98,91 @@ class EvaluationRegressionTests(unittest.TestCase):
             )
 
 
+class ResumeConfigurationRegressionTests(unittest.TestCase):
+    def test_resume_restores_validation_split_from_checkpoint(self):
+        args = SimpleNamespace(
+            shuffle_files=True, file_headers=False, fim_rate=0.0, val_split=0.1,
+        )
+        restore_resume_data_settings(
+            args,
+            {"shuffle_files": False, "file_headers": True, "fim_rate": 0.5, "val_split": 0.2},
+        )
+        self.assertFalse(args.shuffle_files)
+        self.assertTrue(args.file_headers)
+        self.assertEqual(args.fim_rate, 0.5)
+        self.assertEqual(args.val_split, 0.2)
+
+
+class TrainingMaskRegressionTests(unittest.TestCase):
+    def test_rejects_mask_without_training_targets(self):
+        with self.assertRaisesRegex(ValueError, "excluded every target token"):
+            validate_training_targets([False] * 100, split=80)
+
+    def test_accepts_mask_with_training_targets(self):
+        mask = [False] * 100
+        mask[10] = True
+        validate_training_targets(mask, split=80)
+
+
+class RMSNormRegressionTests(unittest.TestCase):
+    def test_preserves_bfloat16_output_dtype_and_finite_gradients(self):
+        norm = RMSNorm(8)
+        x = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
+        y = norm(x)
+        self.assertEqual(y.dtype, x.dtype)
+        y.float().square().sum().backward()
+        self.assertTrue(torch.isfinite(x.grad.float()).all().item())
+        self.assertTrue(torch.isfinite(norm.weight.grad).all().item())
+
+
+class GenerationOptionsRegressionTests(unittest.TestCase):
+    def test_zero_repetition_window_disables_repetition_tracking(self):
+        self.assertEqual(_trim_recent_tokens([1, 2, 3], 0), [])
+        self.assertEqual(_trim_recent_tokens([1, 2, 3], 2), [2, 3])
+
+    def test_negative_repetition_window_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "repetition_window must be >= 0"):
+            _trim_recent_tokens([1, 2, 3], -1)
+
+    def test_invalid_generation_options_are_rejected(self):
+        cases = [
+            (-1, 0.8, 0, 0.95, 1.05, 128),
+            (10, 0.0, 0, 0.95, 1.05, 128),
+            (10, 0.8, -1, 0.95, 1.05, 128),
+            (10, 0.8, 0, 1.5, 1.05, 128),
+            (10, 0.8, 0, 0.95, 0.0, 128),
+            (10, 0.8, 0, 0.95, 1.05, -1),
+        ]
+        for options in cases:
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    validate_generation_options(*options)
+
+
 class CliValidationRegressionTests(unittest.TestCase):
     def test_eval_batches_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "--eval-batches must be >= 1"):
             validate_eval_batches(0)
         validate_eval_batches(1)
+
+    def test_invalid_training_ranges_are_rejected(self):
+        defaults = dict(
+            kd_alpha=0.3, kd_temperature=2.0, dialogue_anchor_ratio=0.7,
+            min_lr_ratio=0.1, memory_slots=0, grad_clip=1.0,
+            optimizer="adamw", muon_ns_steps=5,
+        )
+        validate_training_ranges(SimpleNamespace(**defaults))
+        invalid = [
+            {"kd_alpha": 1.1}, {"kd_temperature": 0.0},
+            {"dialogue_anchor_ratio": -0.1}, {"min_lr_ratio": 1.1},
+            {"memory_slots": -1}, {"grad_clip": -1.0},
+            {"optimizer": "muon", "muon_ns_steps": 0},
+        ]
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                values = {**defaults, **changes}
+                with self.assertRaises(ValueError):
+                    validate_training_ranges(SimpleNamespace(**values))
 
 
 class _FakeGradScaler:

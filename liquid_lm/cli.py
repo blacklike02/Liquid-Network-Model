@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 
@@ -244,6 +245,24 @@ def build_parser():
     return parser
 
 
+def validate_training_ranges(args) -> None:
+    """Validate option ranges that otherwise cause silent or unstable behavior."""
+    if not math.isfinite(args.kd_alpha) or not 0.0 <= args.kd_alpha <= 1.0:
+        raise ValueError("--kd-alpha must be between 0 and 1")
+    if not math.isfinite(args.kd_temperature) or args.kd_temperature <= 0.0:
+        raise ValueError("--kd-temperature must be finite and > 0")
+    if not math.isfinite(args.dialogue_anchor_ratio) or not 0.0 <= args.dialogue_anchor_ratio <= 1.0:
+        raise ValueError("--dialogue-anchor-ratio must be between 0 and 1")
+    if not math.isfinite(args.min_lr_ratio) or not 0.0 <= args.min_lr_ratio <= 1.0:
+        raise ValueError("--min-lr-ratio must be between 0 and 1")
+    if args.memory_slots < 0:
+        raise ValueError("--memory-slots must be >= 0")
+    if args.grad_clip < 0.0:
+        raise ValueError("--grad-clip must be >= 0")
+    if args.optimizer == "muon" and args.muon_ns_steps < 1:
+        raise ValueError("--muon-ns-steps must be >= 1 when --optimizer muon")
+
+
 # ---------------------------------------------------------------------------
 # Triton self-test
 # ---------------------------------------------------------------------------
@@ -356,6 +375,7 @@ def main():
         raise ValueError("--ffn-mult must be >= 0")
     if args.kd_topk < 0:
         raise ValueError("--kd-topk must be >= 0")
+    validate_training_ranges(args)
     if not 0.0 <= args.fim_rate <= 1.0:
         raise ValueError("--fim-rate must be between 0 and 1")
     if args.epochs < 1:
