@@ -14,6 +14,9 @@ from .layers import (
     LockedDropout,
     ResidualFFN,
     _TRITON_AVAILABLE,
+    chunk_memory_read,
+    chunk_memory_reset,
+    chunk_memory_write,
     make_norm,
 )
 
@@ -424,6 +427,21 @@ class LiquidLanguageModel(nn.Module):
             hidden = list(hidden) + [new_conv_buf]
         return logits, hidden
 
+    def _forward_with_chunk_memory(self, tokens, hidden, memory, fused, chunk_size):
+        """Process a prompt in chunks, consulting and updating ChunkMemory."""
+        logits_all = None
+        processed = 0
+        for start in range(0, tokens.size(1), chunk_size):
+            hidden = chunk_memory_read(self, hidden, memory)
+            chunk = tokens[:, start:start + chunk_size]
+            logits_all, hidden = self.forward(chunk, hidden=hidden, fused=fused)
+            processed += chunk.size(1)
+            if processed % chunk_size == 0:
+                memory = chunk_memory_write(self, hidden, memory)
+        if logits_all is None:
+            raise ValueError("Cannot run generation on an empty token sequence.")
+        return logits_all, hidden, memory, processed
+
     @staticmethod
     def _apply_repetition_penalty(logits, recent_tokens, penalty):
         if penalty <= 1.0 or not recent_tokens:
@@ -473,6 +491,7 @@ class LiquidLanguageModel(nn.Module):
         device: torch.device | str = "cpu",
         stop_token_ids: list[int] | None = None,
         only_new: bool = False,
+        memory_chunk_size: int = 128,
     ) -> str:
         validate_generation_options(
             max_new_tokens=max_new_tokens,
@@ -492,7 +511,18 @@ class LiquidLanguageModel(nn.Module):
         stop_ids = set(stop_token_ids or ())
 
         fused = [cell.fused_h_weights() for cell in self.cells]
-        logits_all, hidden = self.forward(tokens, fused=fused)
+        use_chunk_memory = self.chunk_memory is not None
+        memory = None
+        if use_chunk_memory:
+            if memory_chunk_size < 1:
+                raise ValueError("memory_chunk_size must be >= 1 when ChunkMemory is enabled")
+            memory = chunk_memory_reset(self, tokens.size(0), tokens.device)
+            logits_all, hidden, memory, processed_tokens = self._forward_with_chunk_memory(
+                tokens, None, memory, fused, int(memory_chunk_size),
+            )
+        else:
+            logits_all, hidden = self.forward(tokens, fused=fused)
+            processed_tokens = tokens.size(1)
         next_logits = logits_all[:, -1, :].float()
 
         generated_ids = list(prompt_ids)
@@ -513,7 +543,15 @@ class LiquidLanguageModel(nn.Module):
             generated_ids.append(token_id)
             recent_tokens = _trim_recent_tokens(recent_tokens + [token_id], repetition_window)
             if step_i + 1 < max_new_tokens:
-                logits_all, hidden = self.forward(next_token, hidden=hidden, fused=fused)
+                if use_chunk_memory:
+                    if processed_tokens % memory_chunk_size == 0:
+                        hidden = chunk_memory_read(self, hidden, memory)
+                    logits_all, hidden = self.forward(next_token, hidden=hidden, fused=fused)
+                    processed_tokens += 1
+                    if processed_tokens % memory_chunk_size == 0:
+                        memory = chunk_memory_write(self, hidden, memory)
+                else:
+                    logits_all, hidden = self.forward(next_token, hidden=hidden, fused=fused)
                 next_logits = logits_all[:, -1, :].float()
 
         if only_new:

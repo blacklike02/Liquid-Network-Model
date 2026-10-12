@@ -57,6 +57,7 @@ def run_chat_repl(args, device):
             temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
             repetition_window=args.repetition_window,
+            memory_chunk_size=int(checkpoint.get("config", {}).get("seq_len", 128)),
             device=device, stop_token_ids=stop_ids, only_new=True,
         )
         answer = text.strip()
@@ -99,6 +100,7 @@ def run_generate_only(args, device):
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
         repetition_window=args.repetition_window,
+        memory_chunk_size=int(checkpoint.get("config", {}).get("seq_len", 128)),
         device=device, stop_token_ids=stop_ids, only_new=args.chat,
     )
     elapsed = time.perf_counter() - start

@@ -570,8 +570,8 @@ class ChunkMemory(nn.Module):
     lazily in read() — so summarize actually receives gradients. The memory
     only works with --state-carry >= 2.
 
-    Wired into training and evaluate(); generate()/chat do NOT use this
-    memory (a deliberate limitation).
+    Wired into training/evaluate and generation/chat when memory_slots > 0;
+    generation reads/writes summaries at memory_chunk_size token boundaries.
     """
 
     def __init__(self, hidden_size: int, memory_slots: int) -> None:

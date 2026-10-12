@@ -863,6 +863,7 @@ def run_training(args, device):
             preview = model.generate(
                 prompt=args.prompt, tokenizer=tokenizer,
                 max_new_tokens=min(300, args.generate),
+                memory_chunk_size=args.seq_len,
                 temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
                 repetition_penalty=args.repetition_penalty,
                 repetition_window=args.repetition_window,
@@ -917,6 +918,7 @@ def run_training(args, device):
     print_checkpoint_info(best_payload)
     generated = best_model.generate(
         prompt=args.prompt, tokenizer=best_tokenizer, max_new_tokens=args.generate,
+        memory_chunk_size=int(best_payload.get("config", {}).get("seq_len", args.seq_len)),
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
         repetition_window=args.repetition_window,

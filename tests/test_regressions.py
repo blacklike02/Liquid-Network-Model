@@ -1,11 +1,12 @@
 """Regression tests for Liquid-Network-Model's critical sequence paths."""
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-from liquid_lm.layers import RMSNorm
+from liquid_lm.layers import RMSNorm, chunk_memory_read, chunk_memory_write
 from liquid_lm.cli import validate_eval_batches, validate_training_ranges
 from liquid_lm.model import LiquidLanguageModel, _trim_recent_tokens, validate_generation_options
 from liquid_lm.tokenizer import CharTokenizer
@@ -157,6 +158,43 @@ class GenerationOptionsRegressionTests(unittest.TestCase):
             with self.subTest(options=options):
                 with self.assertRaises(ValueError):
                     validate_generation_options(*options)
+
+
+class GenerationMemoryRegressionTests(unittest.TestCase):
+    def test_generation_reads_and_updates_chunk_memory(self):
+        chars = [" ", "a", "b", "c", "d", "e"]
+        tokenizer = CharTokenizer({ch: i for i, ch in enumerate(chars)}, chars)
+        model = LiquidLanguageModel(
+            vocab_size=len(chars), embedding_dim=8, hidden_size=8, num_layers=1,
+            dropout=0.0, zoneout=0.0, tie_weights=True, local_conv=False,
+            memory_slots=2,
+        ).eval()
+
+        with patch("liquid_lm.model.chunk_memory_read", wraps=chunk_memory_read) as read_memory, \
+             patch("liquid_lm.model.chunk_memory_write", wraps=chunk_memory_write) as write_memory:
+            model.generate(
+                prompt="abcde", tokenizer=tokenizer, max_new_tokens=3,
+                temperature=1.0, top_k=0, top_p=1.0, repetition_penalty=1.0,
+                repetition_window=0, device=torch.device("cpu"),
+                stop_token_ids=[], memory_chunk_size=2,
+            )
+
+        self.assertEqual(read_memory.call_count, 4)
+        self.assertEqual(write_memory.call_count, 3)
+
+    def test_generation_rejects_non_positive_memory_chunk_size(self):
+        chars = [" ", "a", "b"]
+        tokenizer = CharTokenizer({ch: i for i, ch in enumerate(chars)}, chars)
+        model = LiquidLanguageModel(
+            vocab_size=len(chars), embedding_dim=8, hidden_size=8, num_layers=1,
+            dropout=0.0, zoneout=0.0, tie_weights=True, local_conv=False,
+            memory_slots=1,
+        ).eval()
+        with self.assertRaisesRegex(ValueError, "memory_chunk_size must be >= 1"):
+            model.generate(
+                prompt="ab", tokenizer=tokenizer, max_new_tokens=1,
+                device=torch.device("cpu"), memory_chunk_size=0,
+            )
 
 
 class CliValidationRegressionTests(unittest.TestCase):

@@ -142,8 +142,8 @@ def build_parser():
                         help="0 (by default) — disabled. >0 — enables ChunkMemory: "
                              "a sliding FIFO buffer of summaries from previous --state-carry subchunks "
                              "(in the style of Transformer-XL memory / the M-CfC idea), read/written "
-                             "around each subchunk in run_training/evaluate. Requires "
-                             "--state-carry >= 2. NOT used in generate()/chat.")
+                             "around each subchunk in run_training/evaluate and every --seq-len tokens "
+                             "in generate()/chat. Requires --state-carry >= 2 for effective training.")
     parser.add_argument("--ffn-mult", type=float, default=0.0,
                         help="0 (default) = off. >0 adds a pre-norm SwiGLU channel-mixing block "
                              "(with its own residual) after every liquid layer, with inner width "

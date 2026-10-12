@@ -35,7 +35,6 @@ file-by-file map. Run all commands from the repository root.
 - Mixture-of-Experts over the readout or liquid layers.
 - Sparse (NCP) input projections; currently the block structure is applied
   only to the recurrent matrix.
-- Using `ChunkMemory` in `generate()` and chat.
 - Batched generation.
 - Hybrid liquid layers with a small number of attention blocks.
 
