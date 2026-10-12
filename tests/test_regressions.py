@@ -4,11 +4,15 @@ import unittest
 import torch
 import torch.nn.functional as F
 
+from liquid_lm.cli import validate_eval_batches
 from liquid_lm.model import LiquidLanguageModel
+from liquid_lm.tokenizer import CharTokenizer
 from liquid_lm.training import (
+    evaluate,
     get_batch,
     grad_scaler_step_succeeded,
     masked_cross_entropy,
+    validate_distillation_tokenizers,
 )
 
 
@@ -43,6 +47,58 @@ class BatchRegressionTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss).item())
         loss.backward()
         self.assertTrue(torch.isfinite(logits.grad).all().item())
+
+
+class DistillationTokenizerRegressionTests(unittest.TestCase):
+    def test_rejects_same_vocab_size_with_different_token_id_mapping(self):
+        student = CharTokenizer({"a": 0, "b": 1}, ["a", "b"])
+        teacher = CharTokenizer({"a": 1, "b": 0}, ["b", "a"])
+
+        with self.assertRaisesRegex(ValueError, "identical tokenizer configurations"):
+            validate_distillation_tokenizers(student, teacher)
+
+    def test_accepts_identical_tokenizer_configurations(self):
+        student = CharTokenizer({"a": 0, "b": 1}, ["a", "b"])
+        teacher = CharTokenizer({"a": 0, "b": 1}, ["a", "b"])
+
+        validate_distillation_tokenizers(student, teacher)
+
+
+class _MaskedEvalModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vocab_size = 7
+        self.chunk_memory = None
+
+    def forward(self, tokens, hidden=None):
+        logits = torch.zeros(
+            tokens.size(0), tokens.size(1), self.vocab_size,
+            dtype=torch.float32, device=tokens.device,
+        )
+        if hidden is None:
+            hidden = [torch.zeros(tokens.size(0), 4, device=tokens.device)]
+        return logits, hidden
+
+
+class EvaluationRegressionTests(unittest.TestCase):
+    def test_evaluate_rejects_validation_batches_without_unmasked_targets(self):
+        model = _MaskedEvalModel()
+        data = torch.arange(64, dtype=torch.long)
+        no_targets = torch.zeros(64, dtype=torch.bool)
+
+        with self.assertRaisesRegex(ValueError, "zero unmasked target tokens"):
+            evaluate(
+                model, data, batch_size=1, seq_len=8, state_carry=1,
+                device=torch.device("cpu"), split_start=0, split_end=64,
+                batches=1, amp_dtype=None, train_mask=no_targets,
+            )
+
+
+class CliValidationRegressionTests(unittest.TestCase):
+    def test_eval_batches_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "--eval-batches must be >= 1"):
+            validate_eval_batches(0)
+        validate_eval_batches(1)
 
 
 class _FakeGradScaler:

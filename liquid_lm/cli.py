@@ -306,6 +306,11 @@ def selftest_triton_tail(device) -> None:
     print("[SELFTEST] RESULT:", "all checks passed" if all_ok else "DIFFERENCES FOUND — do not use --kernel triton")
 
 
+def validate_eval_batches(eval_batches: int) -> None:
+    if eval_batches < 1:
+        raise ValueError("--eval-batches must be >= 1")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -357,6 +362,7 @@ def main():
         raise ValueError("--epochs must be >= 1")
     if args.steps_per_epoch < 1:
         raise ValueError("--steps-per-epoch must be >= 1")
+    validate_eval_batches(args.eval_batches)
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("--dropout must be in [0, 1)")
     if not 0.0 <= args.zoneout < 1.0:

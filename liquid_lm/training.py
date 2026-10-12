@@ -169,6 +169,27 @@ def masked_cross_entropy(logits, targets):
 # ---------------------------------------------------------------------------
 
 
+def validate_distillation_tokenizers(student_tokenizer, teacher_tokenizer) -> None:
+    """Require identical token semantics before aligning teacher/student logits.
+
+    Distillation feeds token IDs produced by the student tokenizer directly to
+    the teacher. Equal vocabulary sizes are not sufficient: IDs can refer to
+    different tokens in independently trained tokenizers.
+    """
+    if teacher_tokenizer.vocab_size != student_tokenizer.vocab_size:
+        raise ValueError(
+            f"Vocab teacher ({teacher_tokenizer.vocab_size}) != "
+            f"student ({student_tokenizer.vocab_size})."
+        )
+    if teacher_tokenizer.to_config() != student_tokenizer.to_config():
+        raise ValueError(
+            "Teacher and student tokenizers must have identical tokenizer "
+            "configurations for distillation. Student token IDs are passed "
+            "directly to the teacher, and logits are aligned by token ID; "
+            "matching vocabulary sizes alone is insufficient."
+        )
+
+
 def kd_loss_full(student_logits, teacher_logits, temperature):
     """Per-token KL(teacher || student) over the full vocabulary, both softened
     by `temperature`. Inputs (N, V) -> output (N,). (Pre-v3.7 behaviour.)"""
@@ -342,6 +363,11 @@ def evaluate(
                 if memory is not None:
                     memory = memory.detach()
             hidden = detach_hidden(hidden)
+    if token_sum.item() == 0:
+        raise ValueError(
+            "Validation produced zero unmasked target tokens. Increase --eval-batches "
+            "or check --loss-mask and the validation data."
+        )
     return (loss_sum / torch.clamp(token_sum, min=1.0)).item()
 
 
@@ -557,10 +583,7 @@ def run_training(args, device):
     if args.teacher_checkpoint:
         teacher_payload = load_checkpoint_raw(Path(args.teacher_checkpoint), device)
         teacher_tokenizer = tokenizer_from_checkpoint(teacher_payload)
-        if teacher_tokenizer.vocab_size != vocab_size:
-            raise ValueError(
-                f"Vocab teacher ({teacher_tokenizer.vocab_size}) != student ({vocab_size})."
-            )
+        validate_distillation_tokenizers(tokenizer, teacher_tokenizer)
         teacher = create_model_from_config(
             vocab_size=vocab_size, config=teacher_payload["config"], device=device,
         )
