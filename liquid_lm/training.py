@@ -304,6 +304,27 @@ def grad_scaler_step_succeeded(optimizer, scaler) -> bool:
     return scaler.get_scale() >= scale_before
 
 
+def normalize_gradients_by_valid_tokens(model, max_tokens: int, valid_tokens: int) -> bool:
+    """Rescale accumulated gradients to the mean over supervised target tokens.
+
+    Each summed loss is divided by the maximum number of positions in the
+    accumulation group. This rescales the resulting gradients to a mean over
+    actually valid targets, which matters when dialogue loss masking is active.
+    Returns False when the group contains no valid targets.
+    """
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be >= 1")
+    valid_tokens = int(valid_tokens)
+    if valid_tokens <= 0:
+        return False
+    factor = float(max_tokens) / valid_tokens
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factor)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Exponential moving average
 # ---------------------------------------------------------------------------
@@ -681,6 +702,7 @@ def run_training(args, device):
         finite_ok = torch.ones((), dtype=torch.bool, device=device)
         epoch_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
+        accumulated_valid_tokens = torch.zeros((), device=device, dtype=torch.long)
 
         for step in range(1, args.steps_per_epoch + 1):
             x_span, y_span = get_batch(
@@ -688,6 +710,7 @@ def run_training(args, device):
                 anchors=dialogue_anchors, anchor_ratio=args.dialogue_anchor_ratio,
                 train_mask=train_mask,
             )
+            accumulated_valid_tokens += (y_span != IGNORE_INDEX).sum()
             hidden = None
             memory = chunk_memory_reset(base_model, x_span.shape[0], device)
             t_hidden = None
@@ -700,6 +723,7 @@ def run_training(args, device):
                 args.grad_accumulation if step <= full_steps
                 else args.steps_per_epoch - full_steps
             )
+            max_tokens_per_group = args.batch_size * epoch_span_len * group_size
 
             for k in range(epoch_state_carry):
                 xk = x_span[:, k * args.seq_len : (k + 1) * args.seq_len]
@@ -711,6 +735,7 @@ def run_training(args, device):
                     raw_loss, sum_loss, valid_count = masked_cross_entropy(
                         logits.reshape(-1, vocab_size), yk.reshape(-1),
                     )
+                    objective_sum = sum_loss
 
                     if teacher is not None:
                         # The teacher now sees the same carried context as the
@@ -730,10 +755,15 @@ def run_training(args, device):
                             kd_per_token = kd_loss_topk(s_flat, t_flat, T, args.kd_topk)
                         else:
                             kd_per_token = kd_loss_full(s_flat, t_flat, T)
-                        kd_loss = (kd_per_token * kd_weights).sum() / kd_weights.sum().clamp(min=1.0)
+                        kd_loss_sum = (kd_per_token * kd_weights).sum()
+                        kd_loss = kd_loss_sum / kd_weights.sum().clamp(min=1.0)
                         raw_loss = (1 - args.kd_alpha) * raw_loss + args.kd_alpha * kd_loss * (T * T)
+                        objective_sum = (
+                            (1 - args.kd_alpha) * sum_loss
+                            + args.kd_alpha * kd_loss_sum * (T * T)
+                        )
 
-                    loss = raw_loss / (epoch_state_carry * group_size)
+                    loss = objective_sum / max_tokens_per_group
 
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -743,6 +773,7 @@ def run_training(args, device):
                 loss_sum += sum_loss.detach().float()
                 token_sum += valid_count.float()
                 finite_ok &= torch.isfinite(raw_loss.detach())
+                finite_ok &= torch.isfinite(loss.detach())
                 if k < epoch_state_carry - 1:
                     memory = chunk_memory_write(base_model, hidden, memory)
                     if memory is not None:
@@ -755,18 +786,26 @@ def run_training(args, device):
             )
             grad_norm_value = None
             if should_update:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                if args.grad_clip > 0:
-                    grad_norm_value = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.grad_clip
-                    ).item()
-                if scaler is not None:
-                    update_succeeded = grad_scaler_step_succeeded(optimizer, scaler)
+                valid_tokens_in_group = int(accumulated_valid_tokens.item())
+                if valid_tokens_in_group > 0:
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                    normalize_gradients_by_valid_tokens(
+                        model, max_tokens_per_group, valid_tokens_in_group,
+                    )
+                    if args.grad_clip > 0:
+                        grad_norm_value = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), args.grad_clip
+                        ).item()
+                    if scaler is not None:
+                        update_succeeded = grad_scaler_step_succeeded(optimizer, scaler)
+                    else:
+                        optimizer.step()
+                        update_succeeded = True
                 else:
-                    optimizer.step()
-                    update_succeeded = True
+                    update_succeeded = False
                 optimizer.zero_grad(set_to_none=True)
+                accumulated_valid_tokens.zero_()
                 if update_succeeded:
                     scheduler.step()
                     global_step += 1

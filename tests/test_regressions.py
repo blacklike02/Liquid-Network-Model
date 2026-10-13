@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from liquid_lm.layers import RMSNorm, chunk_memory_read, chunk_memory_write
+from liquid_lm.layers import LiquidCell, RMSNorm, chunk_memory_read, chunk_memory_write
 from liquid_lm.cli import validate_eval_batches, validate_training_ranges
 from liquid_lm.model import LiquidLanguageModel, _trim_recent_tokens, validate_generation_options
 from liquid_lm.tokenizer import CharTokenizer
@@ -15,6 +15,7 @@ from liquid_lm.training import (
     get_batch,
     grad_scaler_step_succeeded,
     masked_cross_entropy,
+    normalize_gradients_by_valid_tokens,
     restore_resume_data_settings,
     validate_distillation_tokenizers,
     validate_training_targets,
@@ -134,6 +135,20 @@ class RMSNormRegressionTests(unittest.TestCase):
         y.float().square().sum().backward()
         self.assertTrue(torch.isfinite(x.grad.float()).all().item())
         self.assertTrue(torch.isfinite(norm.weight.grad).all().item())
+
+
+class ZoneoutRegressionTests(unittest.TestCase):
+    def test_full_zoneout_preserves_the_previous_hidden_state(self):
+        cell = LiquidCell(
+            input_size=8, hidden_size=8, dropout=0.0,
+            zoneout=1.0, multi_tau=False,
+        ).train()
+        previous = torch.randn(2, 8)
+        current_input = torch.randn(2, 8)
+
+        actual = cell(previous, current_input)
+
+        torch.testing.assert_close(actual, previous)
 
 
 class GenerationOptionsRegressionTests(unittest.TestCase):
@@ -263,6 +278,36 @@ class GradientScalerRegressionTests(unittest.TestCase):
 
         self.assertTrue(updated)
         self.assertAlmostEqual(parameter.item(), 0.9, places=6)
+
+
+class TokenWeightedGradientNormalizationTests(unittest.TestCase):
+    def test_rescales_gradient_to_mean_over_valid_targets(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        # A summed-loss gradient of 3 divided by 6 possible positions is 0.5.
+        model.weight.grad = torch.tensor([[0.5]])
+
+        had_targets = normalize_gradients_by_valid_tokens(
+            model, max_tokens=6, valid_tokens=3,
+        )
+
+        self.assertTrue(had_targets)
+        self.assertAlmostEqual(model.weight.grad.item(), 1.0, places=6)
+
+    def test_empty_group_is_not_rescaled(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        model.weight.grad = torch.tensor([[0.5]])
+
+        had_targets = normalize_gradients_by_valid_tokens(
+            model, max_tokens=6, valid_tokens=0,
+        )
+
+        self.assertFalse(had_targets)
+        self.assertAlmostEqual(model.weight.grad.item(), 0.5, places=6)
+
+    def test_max_tokens_must_be_positive(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        with self.assertRaisesRegex(ValueError, "max_tokens must be >= 1"):
+            normalize_gradients_by_valid_tokens(model, max_tokens=0, valid_tokens=1)
 
 
 class RecurrentModelRegressionTests(unittest.TestCase):

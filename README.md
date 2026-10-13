@@ -498,9 +498,11 @@ updated once per `--grad-accumulation` iterations.
 
 ### Loss function
 
-Cross-entropy for the next token, averaged over **valid** tokens. Each
-sub-chunk loss is divided by `state_carry × accumulation_group_size`, including
-the final incomplete group of an epoch, so contributions are averaged correctly.
+Cross-entropy is normalized over valid target tokens in the full gradient-
+accumulation group. Summed losses are scaled by the maximum target positions;
+before clipping, gradients are rescaled by `max_target_positions / valid_target_tokens`.
+This keeps masked dialogue targets correctly weighted. With no masking, the
+result is equivalent to ordinary mean cross-entropy.
 
 ### Loss mask (`--loss-mask`, enabled by default)
 
@@ -989,9 +991,12 @@ The model is recurrent, so the time loop is sequential:
 
 ## Known limitations
 
-- **ChunkMemory is not used for generation or chat.** A model trained with
-  `--memory-slots > 0` runs without it at inference, creating a small
-  train/inference mismatch.
+- ChunkMemory is active during generation/chat when `--memory-slots > 0`; it
+  reads and writes chunk summaries at the checkpoint's `seq_len` boundaries.
+  This bounded FIFO is not full-history attention and resets for each request.
+- With `--kd-topk > 0`, distillation represents the teacher's probability mass
+  outside top-k as a tail bucket; `--kd-topk 0` enables full-vocabulary KL,
+  with greater memory and compute cost.
 - Distillation calls the teacher without carrying state between sub-chunks.
 - The Triton kernel supports inference and `ltc + euler` only.
 - NCP reproduces connection topology, not the original paper's synapse

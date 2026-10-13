@@ -533,7 +533,7 @@ class LiquidCell(nn.Module):
         out = self.norm(self.dropout(h))
 
         if self.training and self.zoneout > 0.0:
-            prev = self.norm(h_in)
+            prev = h_in
             keep = torch.rand_like(out) < self.zoneout
             out = torch.where(keep, prev, out)
 
