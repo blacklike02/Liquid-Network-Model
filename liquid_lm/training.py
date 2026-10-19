@@ -241,22 +241,20 @@ def kd_loss_topk(student_logits, teacher_logits, temperature, k):
     s = student_logits.float() / temperature
     t = teacher_logits.float() / temperature
     k = max(1, min(int(k), t.size(-1)))
+    if k == t.size(-1):
+        return kd_loss_full(student_logits, teacher_logits, temperature)
     log_ps = F.log_softmax(s, dim=-1)
     log_pt = F.log_softmax(t, dim=-1)
     idx = torch.topk(t, k, dim=-1).indices  # temperature does not change the order
     lt = log_pt.gather(-1, idx)
     ls = log_ps.gather(-1, idx)
-    log_mass_t = torch.logsumexp(lt, dim=-1)
-    log_mass_s = torch.logsumexp(ls, dim=-1)
-    mass_t = log_mass_t.exp()
-    mass_s = log_mass_s.exp()
-    tail_t = (1.0 - mass_t).clamp(min=1e-6)
-    tail_s = (1.0 - mass_s).clamp(min=1e-6)
-    binary = mass_t * (log_mass_t - log_mass_s) + tail_t * (tail_t.log() - tail_s.log())
-    cond_t = lt - log_mass_t.unsqueeze(-1)
-    cond_s = ls - log_mass_s.unsqueeze(-1)
-    cond_kl = (cond_t.exp() * (cond_t - cond_s)).sum(dim=-1)
-    return binary + mass_t * cond_kl
+    # Sum the complement in log space. Subtracting top-k mass from 1 loses
+    # tiny tails in float32; clamping them also removes the student's gradient.
+    log_tail_t = torch.logsumexp(log_pt.scatter(-1, idx, float("-inf")), dim=-1)
+    log_tail_s = torch.logsumexp(log_ps.scatter(-1, idx, float("-inf")), dim=-1)
+    head_kl = (lt.exp() * (lt - ls)).sum(dim=-1)
+    tail_kl = log_tail_t.exp() * (log_tail_t - log_tail_s)
+    return head_kl + tail_kl
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +637,9 @@ def run_training(args, device):
             p.requires_grad = False
         print(f"[KD] Teacher loaded: {args.teacher_checkpoint}")
 
-    if args.compile:
+    if args.compile and args.kernel == "triton":
+        print("[COMPILE] Skipping torch.compile: --kernel triton uses the eager recurrent step.")
+    elif args.compile:
         ok, mode_used = model.enable_compiled_step(args.compile_mode, batch_size=args.batch_size)
         if ok:
             print(f"[COMPILE] Recurrent step compiled (mode={mode_used}).")
@@ -793,10 +793,12 @@ def run_training(args, device):
                     normalize_gradients_by_valid_tokens(
                         model, max_tokens_per_group, valid_tokens_in_group,
                     )
-                    if args.grad_clip > 0:
-                        grad_norm_value = torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), args.grad_clip
-                        ).item()
+                    # Without GradScaler an invalid gradient must fail BEFORE
+                    # optimizer.step(), including when clipping is disabled.
+                    grad_norm_value = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.grad_clip if args.grad_clip > 0 else math.inf,
+                        error_if_nonfinite=scaler is None,
+                    ).item()
                     if scaler is not None:
                         update_succeeded = grad_scaler_step_succeeded(optimizer, scaler)
                     else:

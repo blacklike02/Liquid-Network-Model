@@ -11,7 +11,12 @@ import torch
 
 from .inference import run_generate_only
 from .layers import LiquidCell, _TRITON_AVAILABLE
-from .model import load_checkpoint_raw, print_checkpoint_info, set_trust_checkpoints
+from .model import (
+    load_checkpoint_raw,
+    print_checkpoint_info,
+    set_trust_checkpoints,
+    validate_generation_options,
+)
 from .tokenizer import _HAS_TOKENIZERS
 from .training import run_training
 from .utils import choose_device, print_device_info, set_seed
@@ -156,13 +161,12 @@ def build_parser():
                              "layer (default) = LayerNorm, rms = RMSNorm (no mean/bias). "
                              "Stored in the checkpoint.")
     parser.add_argument("--kernel", type=str, choices=["torch", "triton"], default="torch",
-                        help="Backend for the ltc substep tail. torch (by default) — standard "
-                             "PyTorch operations. triton — a SINGLE fused kernel instead of ~8 "
-                             "elementwise operations. INFERENCE ONLY (generate/chat/evaluate; "
-                             "the kernel has no backward), CUDA + triton package only, only "
-                             "--gate-mode ltc --ode-solver euler; in other cases "
-                             "falls back to torch with a message. Before use, "
-                             "run --selftest-triton on your GPU.")
+                        help="Backend for LTC substep activations and tail. torch (default) uses standard "
+                             "PyTorch operations; triton uses fused CUDA forward/backward "
+                             "kernels (first-order gradients). Requires CUDA + Triton and "
+                             "supports only --gate-mode ltc --ode-solver euler. Uses eager "
+                             "recurrent steps instead of torch.compile. Run --selftest-triton "
+                             "and benchmark full-model training before long runs.")
     parser.add_argument("--selftest-triton", action="store_true",
                         help="Compare the triton kernel with the torch path, benchmark it, then exit.")
     parser.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=False,
@@ -323,6 +327,8 @@ def selftest_triton_tail(device) -> None:
             f"triton={t_triton:.3f} ms/step"
         )
     print("[SELFTEST] RESULT:", "all checks passed" if all_ok else "DIFFERENCES FOUND — do not use --kernel triton")
+    if not all_ok:
+        raise SystemExit(2)
 
 
 def validate_eval_batches(eval_batches: int) -> None:
@@ -352,6 +358,13 @@ def main():
         checkpoint = load_checkpoint_raw(Path(args.checkpoint), device)
         print_checkpoint_info(checkpoint)
         return
+
+    # Training also generates previews: reject bad sampling options before
+    # spending an epoch training or loading an inference checkpoint.
+    validate_generation_options(
+        args.generate, args.temperature, args.top_k, args.top_p,
+        args.repetition_penalty, args.repetition_window,
+    )
 
     if args.generate_only or args.chat or args.chat_repl:
         run_generate_only(args, device)

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra.cuda import libdevice
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
@@ -105,11 +106,73 @@ class ResidualFFN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Triton kernel (inference only)
+# Triton kernel (experimental: inference + first-order training backward)
 # ---------------------------------------------------------------------------
 
 
 if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _ltc_activations_kernel(
+        fused_ptr, xp_ptr, tx_ptr, candidate_ptr, tau_hidden_ptr,
+        n_elements, H: tl.constexpr,
+        F0: tl.constexpr, F1: tl.constexpr,
+        X0: tl.constexpr, X1: tl.constexpr,
+        T0: tl.constexpr, T1: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        row, col = offs // H, offs % H
+        f0 = tl.load(fused_ptr + row * F0 + col * F1, mask, other=0).to(tl.float32)
+        f1 = tl.load(fused_ptr + row * F0 + (col + H) * F1, mask, other=0).to(tl.float32)
+        xp = tl.load(xp_ptr + row * X0 + col * X1, mask, other=0).to(tl.float32)
+        tx = tl.load(tx_ptr + row * T0 + col * T1, mask, other=0).to(tl.float32)
+        # PyTorch rounds each addition before tanh under FP16/BF16 autocast.
+        candidate_sum = (xp + f0).to(candidate_ptr.dtype.element_ty).to(tl.float32)
+        tau_sum = (f1 + tx).to(tau_hidden_ptr.dtype.element_ty).to(tl.float32)
+        tl.store(candidate_ptr + offs, libdevice.tanh(candidate_sum), mask)
+        tl.store(tau_hidden_ptr + offs, libdevice.tanh(tau_sum), mask)
+
+    @triton.jit
+    def _ltc_activations_backward_kernel(
+        candidate_ptr, tau_hidden_ptr, grad_candidate_ptr, grad_tau_hidden_ptr,
+        grad_fused_ptr, grad_xp_ptr, grad_tx_ptr,
+        n_elements, H: tl.constexpr,
+        C0: tl.constexpr, C1: tl.constexpr,
+        T0: tl.constexpr, T1: tl.constexpr,
+        HAS_CANDIDATE_GRAD: tl.constexpr, HAS_TAU_GRAD: tl.constexpr,
+        SHARED_GRADS: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        row, col = offs // H, offs % H
+        candidate = tl.load(candidate_ptr + offs, mask, other=0).to(tl.float32)
+        tau_hidden = tl.load(tau_hidden_ptr + offs, mask, other=0).to(tl.float32)
+        dc = tl.full((BLOCK,), 0, tl.float32)
+        dt = tl.full((BLOCK,), 0, tl.float32)
+        if HAS_CANDIDATE_GRAD:
+            dc = tl.load(grad_candidate_ptr + row * C0 + col * C1, mask, other=0).to(tl.float32)
+        if HAS_TAU_GRAD:
+            dt = tl.load(grad_tau_hidden_ptr + row * T0 + col * T1, mask, other=0).to(tl.float32)
+        # CUDA's native tanh backward uses scalar_t arithmetic: FP16/BF16
+        # round the square and subtraction as well as the final product.
+        # Keeping only FP32 intermediates here changes AMP training gradients.
+        c_square = (candidate * candidate).to(candidate_ptr.dtype.element_ty).to(tl.float32)
+        t_square = (tau_hidden * tau_hidden).to(tau_hidden_ptr.dtype.element_ty).to(tl.float32)
+        c_slope = (1.0 - c_square).to(candidate_ptr.dtype.element_ty).to(tl.float32)
+        t_slope = (1.0 - t_square).to(tau_hidden_ptr.dtype.element_ty).to(tl.float32)
+        if candidate_ptr.dtype.element_ty == tl.float32:
+            c_slope = libdevice.fma(-candidate, candidate, 1.0)
+        if tau_hidden_ptr.dtype.element_ty == tl.float32:
+            t_slope = libdevice.fma(-tau_hidden, tau_hidden, 1.0)
+        dc = dc * c_slope
+        dt = dt * t_slope
+        tl.store(grad_fused_ptr + row * (2 * H) + col, dc, mask)
+        tl.store(grad_fused_ptr + row * (2 * H) + H + col, dt, mask)
+        if not SHARED_GRADS:
+            tl.store(grad_xp_ptr + offs, dc, mask)
+            tl.store(grad_tx_ptr + offs, dt, mask)
 
     @triton.jit
     def _ltc_tail_kernel(
@@ -143,11 +206,119 @@ if _TRITON_AVAILABLE:
         res = decay * h + (1.0 - decay) * cand
         tl.store(out_ptr + offs, res.to(out_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit
+    def _ltc_tail_backward_kernel(
+        h_ptr, cand_ptr, tau_raw_ptr, mix_ptr, grad_ptr,
+        grad_h_ptr, grad_cand_ptr, grad_tau_ptr, grad_mix_ptr,
+        sub_dt, min_tau, n_elements, H,
+        MULTI_TAU: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """Fused first-order backward for the exact LTC Euler tail update."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        h = tl.load(h_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        cand = tl.load(cand_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        grad = tl.load(grad_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        row = offs // H
+        col = offs - row * H
+        base = row * (3 * H) + col
+
+        if MULTI_TAU:
+            r0 = tl.load(tau_raw_ptr + base, mask=mask, other=0.0).to(tl.float32) - 2.0
+            r1 = tl.load(tau_raw_ptr + base + H, mask=mask, other=0.0).to(tl.float32)
+            r2 = tl.load(tau_raw_ptr + base + 2 * H, mask=mask, other=0.0).to(tl.float32) + 2.0
+            s0 = 1.0 / (1.0 + tl.exp(-r0))
+            s1 = 1.0 / (1.0 + tl.exp(-r1))
+            s2 = 1.0 / (1.0 + tl.exp(-r2))
+            t0 = tl.maximum(r0, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(r0))) + 0.05
+            t1 = tl.maximum(r1, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(r1))) + 0.01
+            t2 = tl.maximum(r2, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(r2))) + 0.001
+            w0 = tl.load(mix_ptr).to(tl.float32)
+            w1 = tl.load(mix_ptr + 1).to(tl.float32)
+            w2 = tl.load(mix_ptr + 2).to(tl.float32)
+            tau = w0 * t0 + w1 * t1 + w2 * t2
+        else:
+            raw = tl.load(tau_raw_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            sig = 1.0 / (1.0 + tl.exp(-raw))
+            tau = tl.maximum(raw, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(raw))) + min_tau
+
+        decay = tl.exp(-sub_dt / tau)
+        # d update / d tau = (h - candidate) * exp(-dt/tau) * dt / tau^2
+        grad_tau = grad * (h - cand) * decay * sub_dt / (tau * tau)
+        tl.store(grad_h_ptr + offs, grad * decay, mask=mask)
+        tl.store(grad_cand_ptr + offs, grad * (1.0 - decay), mask=mask)
+
+        if MULTI_TAU:
+            tl.store(grad_tau_ptr + base, grad_tau * w0 * s0, mask=mask)
+            tl.store(grad_tau_ptr + base + H, grad_tau * w1 * s1, mask=mask)
+            tl.store(grad_tau_ptr + base + 2 * H, grad_tau * w2 * s2, mask=mask)
+            # Sum within the CTA: global scratch is O(ceil(B*H/BLOCK)), not O(B*H).
+            mix0 = tl.sum(tl.where(mask, grad_tau * t0, 0.0), axis=0)
+            mix1 = tl.sum(tl.where(mask, grad_tau * t1, 0.0), axis=0)
+            mix2 = tl.sum(tl.where(mask, grad_tau * t2, 0.0), axis=0)
+            tl.store(grad_mix_ptr + pid * 3, mix0)
+            tl.store(grad_mix_ptr + pid * 3 + 1, mix1)
+            tl.store(grad_mix_ptr + pid * 3 + 2, mix2)
+        else:
+            tl.store(grad_tau_ptr + offs, grad_tau * sig, mask=mask)
+
+def _ltc_activations_triton(fused, xp, tx):
+    """Two add/tanh operations without intermediate sums or slice backward."""
+    batch, hidden = xp.shape
+    candidate = torch.empty((batch, hidden), device=xp.device,
+                            dtype=torch.promote_types(fused.dtype, xp.dtype))
+    tau_hidden = torch.empty((batch, hidden), device=tx.device,
+                             dtype=torch.promote_types(fused.dtype, tx.dtype))
+    _ltc_activations_kernel[(triton.cdiv(batch * hidden, 1024),)](
+        fused, xp, tx, candidate, tau_hidden, batch * hidden, hidden,
+        *fused.stride(), *xp.stride(), *tx.stride(), BLOCK=1024,
+    )
+    return candidate, tau_hidden
+
+
+class _LTCActivationsAutograd(torch.autograd.Function):
+    """First-order backward also combines the two recurrent projection slices."""
+
+    @staticmethod
+    def forward(ctx, fused, xp, tx):
+        candidate, tau_hidden = _ltc_activations_triton(fused, xp, tx)
+        ctx.save_for_backward(candidate, tau_hidden)
+        ctx.input_dtypes = fused.dtype, xp.dtype, tx.dtype
+        ctx.set_materialize_grads(False)
+        return candidate, tau_hidden
+
+    @staticmethod
+    def backward(ctx, grad_candidate, grad_tau_hidden):
+        candidate, tau_hidden = ctx.saved_tensors
+        batch, hidden = candidate.shape
+        fused_dtype, xp_dtype, tx_dtype = ctx.input_dtypes
+        grad_fused = torch.empty((batch, 2 * hidden), device=candidate.device, dtype=fused_dtype)
+        shared = fused_dtype == xp_dtype == tx_dtype
+        # Views of the combined gradient avoid both slice-scatter kernels and
+        # separate buffers when all input dtypes match (including normal AMP).
+        grad_xp = grad_fused[:, :hidden] if shared else torch.empty_like(candidate, dtype=xp_dtype)
+        grad_tx = grad_fused[:, hidden:] if shared else torch.empty_like(tau_hidden, dtype=tx_dtype)
+        gc = grad_candidate if grad_candidate is not None else candidate
+        gt = grad_tau_hidden if grad_tau_hidden is not None else tau_hidden
+        _ltc_activations_backward_kernel[(triton.cdiv(batch * hidden, 1024),)](
+            candidate, tau_hidden, gc, gt, grad_fused, grad_xp, grad_tx,
+            batch * hidden, hidden, *gc.stride(), *gt.stride(),
+            HAS_CANDIDATE_GRAD=grad_candidate is not None,
+            HAS_TAU_GRAD=grad_tau_hidden is not None,
+            SHARED_GRADS=shared, BLOCK=1024, enable_fp_fusion=False,
+        )
+        return grad_fused, grad_xp, grad_tx
+
+
+def _ltc_activations_triton_autograd(fused, xp, tx):
+    if torch.is_grad_enabled():
+        return _LTCActivationsAutograd.apply(fused, xp, tx)
+    return _ltc_activations_triton(fused, xp, tx)
+
 
 def _ltc_tail_triton(h, candidate, tau_raw, mix_w, sub_dt, min_tau, multi_tau):
-    """Wrapper around _ltc_tail_kernel. INFERENCE ONLY: the kernel has no backward
-    (see LiquidCell._use_triton_tail — it is never called when autograd is
-    enabled)."""
+    """Run the fused forward tail; _LTCTailAutograd supplies its first-order backward."""
     h = h.contiguous()
     candidate = candidate.contiguous()
     tau_raw = tau_raw.contiguous()
@@ -163,6 +334,58 @@ def _ltc_tail_triton(h, candidate, tau_raw, mix_w, sub_dt, min_tau, multi_tau):
     )
     return out
 
+
+class _LTCTailAutograd(torch.autograd.Function):
+    """Triton LTC tail with a first-order custom backward."""
+
+    @staticmethod
+    def forward(ctx, h, candidate, tau_raw, mix_w, sub_dt, min_tau, multi_tau):
+        h_c = h.contiguous()
+        cand_c = candidate.contiguous()
+        tau_c = tau_raw.contiguous()
+        has_mix = mix_w is not None
+        mix_c = mix_w.contiguous() if has_mix else h.new_empty((0,))
+        ctx.save_for_backward(h_c, cand_c, tau_c, mix_c)
+        ctx.sub_dt = float(sub_dt)
+        ctx.min_tau = float(min_tau)
+        ctx.multi_tau = bool(multi_tau)
+        return _ltc_tail_triton(
+            h_c, cand_c, tau_c, mix_c if has_mix else None,
+            ctx.sub_dt, ctx.min_tau, ctx.multi_tau,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        h, candidate, tau_raw, mix_w = ctx.saved_tensors
+        batch, hidden = h.shape
+        n_elements = batch * hidden
+        grad_output = grad_output.contiguous()
+        grad_h = torch.empty_like(h)
+        grad_candidate = torch.empty_like(candidate)
+        grad_tau_raw = torch.empty_like(tau_raw)
+        block = 1024
+        grid_size = triton.cdiv(n_elements, block)
+        grad_mix_parts = (
+            torch.empty((grid_size, 3), device=h.device, dtype=torch.float32)
+            if ctx.multi_tau else grad_h
+        )
+        _ltc_tail_backward_kernel[(grid_size,)](
+            h, candidate, tau_raw, mix_w, grad_output,
+            grad_h, grad_candidate, grad_tau_raw, grad_mix_parts,
+            ctx.sub_dt, ctx.min_tau, n_elements, hidden,
+            MULTI_TAU=ctx.multi_tau, BLOCK=block,
+        )
+        grad_mix = grad_mix_parts.sum(dim=0) if ctx.multi_tau else None
+        return grad_h, grad_candidate, grad_tau_raw, grad_mix, None, None, None
+
+
+def _ltc_tail_triton_autograd(h, candidate, tau_raw, mix_w, sub_dt, min_tau, multi_tau):
+    # Custom autograd is needed only while recording a backward graph.
+    if torch.is_grad_enabled():
+        return _LTCTailAutograd.apply(
+            h, candidate, tau_raw, mix_w, sub_dt, min_tau, multi_tau
+        )
+    return _ltc_tail_triton(h, candidate, tau_raw, mix_w, sub_dt, min_tau, multi_tau)
 
 # ---------------------------------------------------------------------------
 # NCP recurrent matrix
@@ -438,20 +661,17 @@ class LiquidCell(nn.Module):
         return xp, tx
 
     def _use_triton_tail(self, h: torch.Tensor) -> bool:
-        """The Triton tail is enabled ONLY when it is safe: explicitly requested
-        (--kernel triton), the package is present, the tensor is on CUDA, it is
-        ltc+euler, the cell is in eval mode and autograd is disabled (the
-        kernel has no backward)."""
+        """Use the opt-in Triton LTC tail for CUDA inference/training.
+
+        The experimental backward supports first-order gradients for LTC + Euler.
+        """
         return (
             self.kernel == "triton"
             and _TRITON_AVAILABLE
             and h.is_cuda
-            and not self.training
-            and not torch.is_grad_enabled()
             and self.gate_mode == "ltc"
             and self.ode_solver == "euler"
         )
-
     def _ltc_step(
         self, h: torch.Tensor, xp: torch.Tensor, tx: torch.Tensor,
         sub_dt: float, fused_w: torch.Tensor, fused_b: torch.Tensor,
@@ -463,11 +683,16 @@ class LiquidCell(nn.Module):
         for the heun corrector (see forward)."""
         H = self.hidden_size
         fused = self._fused_from_h(h, fused_w, fused_b)
-        candidate = torch.tanh(xp + fused[:, :H])
-        tau_raw = self.tau_net[2](torch.tanh(fused[:, H:] + tx))
-        if self._use_triton_tail(h):
+        use_triton = self._use_triton_tail(h)
+        if use_triton:
+            candidate, tau_hidden = _ltc_activations_triton_autograd(fused, xp, tx)
+        else:
+            candidate = torch.tanh(xp + fused[:, :H])
+            tau_hidden = torch.tanh(fused[:, H:] + tx)
+        tau_raw = self.tau_net[2](tau_hidden)
+        if use_triton:
             mix_w = F.softmax(self.tau_mix, dim=0) if self.multi_tau else None
-            h_new = _ltc_tail_triton(
+            h_new = _ltc_tail_triton_autograd(
                 h, candidate, tau_raw, mix_w, sub_dt, self.min_tau, self.multi_tau
             )
             return h_new, candidate, None
@@ -609,6 +834,9 @@ class ChunkMemory(nn.Module):
         )
 
     def read(self, h0: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        # CfC can return an autocast FP16/BF16 state. Reads between chunks run
+        # outside autocast, so match the projection's parameter dtype here.
+        h0 = h0.to(dtype=self.query_proj.weight.dtype)
         mem = torch.tanh(self.summarize(memory))                       # (B,slots,H)
         q = self.query_proj(h0).unsqueeze(1)                           # (B,1,H)
         k = self.key_proj(mem)                                         # (B,slots,H)

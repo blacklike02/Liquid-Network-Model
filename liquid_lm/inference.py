@@ -27,7 +27,9 @@ def run_chat_repl(args, device):
     model.eval()
     if args.kernel != "torch":
         model.set_kernel(args.kernel)
-    if args.compile:
+    if args.compile and args.kernel == "triton":
+        print("[COMPILE] Skipping torch.compile: --kernel triton uses the eager recurrent step.")
+    elif args.compile:
         ok, mode_used = model.enable_compiled_step(args.compile_mode, batch_size=1, inference=True)
         print(
             f"[COMPILE] Шаг скомпилирован (mode={mode_used})."
@@ -79,7 +81,9 @@ def run_generate_only(args, device):
     model.eval()
     if args.kernel != "torch":
         model.set_kernel(args.kernel)
-    if args.compile:
+    if args.compile and args.kernel == "triton":
+        print("[COMPILE] Skipping torch.compile: --kernel triton uses the eager recurrent step.")
+    elif args.compile:
         ok, mode_used = model.enable_compiled_step(args.compile_mode, batch_size=1, inference=True)
         if ok:
             print(f"[COMPILE] Шаг скомпилирован (mode={mode_used}).")

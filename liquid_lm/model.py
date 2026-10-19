@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
+import tempfile
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -230,10 +233,12 @@ class LiquidLanguageModel(nn.Module):
         self._kernel = "torch"
 
     def set_kernel(self, kernel: str) -> str:
-        """Select the backend for the tail of the ltc substep: "torch" (default) or
-        "triton" (inference only, see _ltc_tail_kernel). If triton cannot be
-        enabled, prints the reason and stays on torch without failing.
-        Returns the backend actually selected."""
+        """Select torch or experimental Triton backend for the LTC substep.
+
+        Triton supports inference and first-order training backward for LTC + Euler.
+        If unavailable, prints the reason and keeps the PyTorch backend.
+        Returns the backend actually selected.
+        """
         if kernel not in ("torch", "triton"):
             raise ValueError(f"Неизвестный kernel: {kernel!r} (ожидался 'torch' или 'triton')")
         actual = kernel
@@ -380,6 +385,7 @@ class LiquidLanguageModel(nn.Module):
         hidden: list[torch.Tensor] | None = None,
         dt: float = 1.0,
         fused: list | None = None,
+        last_token_only: bool = False,
     ):
         batch_size, seq_len = tokens.shape
         conv_buf = None
@@ -411,7 +417,7 @@ class LiquidLanguageModel(nn.Module):
         outputs = []
         # The compiled step has no triton branch — so with the triton
         # kernel active, inference goes through eager _step_impl.
-        if self._kernel == "triton" and not self.training:
+        if self._kernel == "triton":
             step_fn = self._step_impl
         else:
             step_fn = self._step_fn
@@ -421,7 +427,9 @@ class LiquidLanguageModel(nn.Module):
             )
             outputs.append(out_t)
 
-        features = torch.stack(outputs, dim=1)
+        # Generation needs the final prediction only. Keep all recurrent
+        # updates, but avoid projecting the whole prompt into vocabulary space.
+        features = outputs[-1].unsqueeze(1) if last_token_only else torch.stack(outputs, dim=1)
         logits = self.readout(features)
         if new_conv_buf is not None:
             hidden = list(hidden) + [new_conv_buf]
@@ -434,7 +442,7 @@ class LiquidLanguageModel(nn.Module):
         for start in range(0, tokens.size(1), chunk_size):
             hidden = chunk_memory_read(self, hidden, memory)
             chunk = tokens[:, start:start + chunk_size]
-            logits_all, hidden = self.forward(chunk, hidden=hidden, fused=fused)
+            logits_all, hidden = self.forward(chunk, hidden=hidden, fused=fused, last_token_only=True)
             processed += chunk.size(1)
             if processed % chunk_size == 0:
                 memory = chunk_memory_write(self, hidden, memory)
@@ -521,7 +529,7 @@ class LiquidLanguageModel(nn.Module):
                 tokens, None, memory, fused, int(memory_chunk_size),
             )
         else:
-            logits_all, hidden = self.forward(tokens, fused=fused)
+            logits_all, hidden = self.forward(tokens, fused=fused, last_token_only=True)
             processed_tokens = tokens.size(1)
         next_logits = logits_all[:, -1, :].float()
 
@@ -663,7 +671,22 @@ def save_checkpoint(
         "corpus_sha256": corpus_sha256,
         "config": vars(args),
     }
-    torch.save(payload, path)
+    # Replace only after a complete write, so an interrupted/failed save keeps
+    # the previous checkpoint intact. Use the same directory/filesystem.
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=f".{path.name}.", suffix=".tmp",
+            dir=path.parent, delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            torch.save(payload, stream)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 _TRUST_CHECKPOINTS = False

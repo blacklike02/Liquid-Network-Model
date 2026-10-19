@@ -371,5 +371,61 @@ class RecurrentModelRegressionTests(unittest.TestCase):
                         self.assertLess(model.cells[0].recurrent_param_fraction, 1.0)
 
 
+class TritonLtcAutogradRegressionTests(unittest.TestCase):
+    def test_triton_tail_forward_and_backward_match_torch_reference(self):
+        from liquid_lm.layers import _TRITON_AVAILABLE, _ltc_tail_triton_autograd
+
+        if not torch.cuda.is_available() or not _TRITON_AVAILABLE:
+            self.skipTest("requires CUDA and the optional Triton package")
+
+        torch.manual_seed(41)
+        device = torch.device("cuda")
+        batch, hidden = 3, 32
+        probe = torch.randn(batch, hidden, device=device)
+
+        for multi_tau in (False, True):
+            with self.subTest(multi_tau=multi_tau):
+                tau_width = hidden * (3 if multi_tau else 1)
+                h0 = torch.randn(batch, hidden, device=device)
+                cand0 = torch.tanh(torch.randn(batch, hidden, device=device))
+                raw0 = torch.randn(batch, tau_width, device=device) * 0.7
+                mix0 = torch.softmax(torch.randn(3, device=device), dim=0) if multi_tau else None
+
+                h = h0.detach().clone().requires_grad_(True)
+                cand = cand0.detach().clone().requires_grad_(True)
+                raw = raw0.detach().clone().requires_grad_(True)
+                mix = mix0.detach().clone().requires_grad_(True) if multi_tau else None
+                actual = _ltc_tail_triton_autograd(h, cand, raw, mix, 0.75, 0.05, multi_tau)
+                (actual * probe).sum().backward()
+                actual_grads = [h.grad, cand.grad, raw.grad]
+                if multi_tau:
+                    actual_grads.append(mix.grad)
+
+                hr = h0.detach().clone().requires_grad_(True)
+                cr = cand0.detach().clone().requires_grad_(True)
+                rr = raw0.detach().clone().requires_grad_(True)
+                mr = mix0.detach().clone().requires_grad_(True) if multi_tau else None
+                if multi_tau:
+                    banks = rr.view(batch, 3, hidden)
+                    taus = torch.stack((
+                        F.softplus(banks[:, 0] - 2.0) + 0.05,
+                        F.softplus(banks[:, 1]) + 0.01,
+                        F.softplus(banks[:, 2] + 2.0) + 0.001,
+                    ), dim=1)
+                    tau = (taus * mr.view(1, 3, 1)).sum(dim=1)
+                else:
+                    tau = F.softplus(rr) + 0.05
+                decay = torch.exp(-0.75 / tau)
+                expected = decay * hr + (1.0 - decay) * cr
+                (expected * probe).sum().backward()
+                expected_grads = [hr.grad, cr.grad, rr.grad]
+                if multi_tau:
+                    expected_grads.append(mr.grad)
+
+                torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+                for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+                    torch.testing.assert_close(actual_grad, expected_grad, rtol=4e-4, atol=4e-5)
+
+
 if __name__ == "__main__":
     unittest.main()

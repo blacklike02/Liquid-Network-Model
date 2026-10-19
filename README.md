@@ -35,15 +35,16 @@ provides fixed-size memory and generation cost linear in sequence length.
 15. [Known limitations](#known-limitations)
 16. [Troubleshooting](#troubleshooting)
 17. [Code structure](#code-structure)
-18. [Change history](#change-history)
-19. [Sources and inspiration](#sources-and-inspiration)
+18. [Tests and measured results](#tests-and-measured-results)
+19. [Change history](#change-history)
+20. [Sources and inspiration](#sources-and-inspiration)
 
 ## Features
 
 **Model**
 
-- Two cell types: **LTC** (exponential ODE integrator) and **CfC** (the
-  closed-form formulation from Hasani et al., 2022).
+- Two cell types: **LTC-inspired** exponential ODE updates and **CfC-style**
+  closed-form interpolation, based on Hasani et al., 2022.
 - **Multi-tau**: fast, medium, and slow time-constant banks mixed by a learned
   softmax.
 - Euler (default) and Heun (RK2, second-order) sub-step solvers.
@@ -91,8 +92,8 @@ provides fixed-size memory and generation cost linear in sequence length.
 
 - Temperature, top-k, top-p, and repetition-penalty sampling.
 - One-shot chat requests and an interactive REPL with history.
-- Optional fused Triton kernel for the LTC sub-step tail (inference only,
-  CUDA).
+- Optional fused Triton kernels for LTC activations and the sub-step tail, with inference and
+  experimental first-order training backward on CUDA.
 
 ## Requirements and installation
 
@@ -111,7 +112,7 @@ provides fixed-size memory and generation cost linear in sequence length.
 | `charset-normalizer` | Accurate text-file encoding detection |
 | `tensorboard` | Logging with `--log-backend tensorboard` |
 | `wandb` | Logging with `--log-backend wandb` (`wandb login` required) |
-| `triton` | Fused inference kernel (`--kernel triton`, Linux + NVIDIA) |
+| `triton` | Fused LTC Euler inference/training kernel; a compatible `triton-windows` build was also tested on Windows |
 
 ```bash
 python -m venv .venv
@@ -130,14 +131,18 @@ pip install tensorboard wandb
 Check that the GPU is visible:
 
 ```bash
-python liquid_text_model.py --info --checkpoint nonexistent.pt   # prints Device/GPU/VRAM, then reports the checkpoint error
+python -c "import sys, torch; print(sys.executable); print(torch.__version__, torch.version.cuda); print('CUDA:', torch.cuda.is_available())"
 ```
 
-At startup the program prints the device, PyTorch version, GPU name, VRAM,
-CUDA version, and Tensor Core status (TF32 / bf16), then reports the missing
-checkpoint.
+Use the same interpreter for training and tests, with a CUDA-enabled PyTorch
+build for GPU execution. A CPU-only build cannot use CUDA even when the driver
+detects the GPU. The CLI prints the device, GPU, VRAM and Tensor Core settings
+at startup.
 
 ## Quick start
+
+Datasets and trained checkpoints are not bundled with the repository. Prepare
+your corpus before training.
 
 1. Put text files in `data/` (subdirectories are supported):
 
@@ -275,8 +280,9 @@ Role mapping: `user`, `human` → `<|user|>`; `assistant`, `gpt`, `bot`, `model`
   `--shuffle-files` is enabled by default. Files are ordered by SHA-256 of their
   relative path, deterministically.
 - Both splits must be longer than `seq_len × state_carry + 2` tokens.
-- The BPE tokenizer is trained **only on the training portion**, so the
-  validation vocabulary cannot leak into training.
+- BPE is trained on a text prefix selected by character count, while the final
+  train/validation boundary uses token count. These boundaries can differ with
+  uneven token density; strict split isolation remains a follow-up task.
 
 ## Tokenizers
 
@@ -343,7 +349,7 @@ the whole sequence before the loop.
 
 ### LiquidCell — `ltc` mode (default)
 
-The cell models a linear ODE with an input-dependent time constant:
+The cell models LTC-inspired dynamics with an input/state-dependent time constant:
 
 ```
 dh/dt = (candidate − h) / τ
@@ -359,7 +365,9 @@ decay = exp(−dt / τ)
 h_new = decay · h + (1 − decay) · candidate
 ```
 
-This exponential integrator is stable for any `dt` and `τ > 0`.
+For `dt >= 0` and `τ > 0`, this frozen update is a convex combination of the
+old state and candidate. This property alone does not establish stability of
+the full nonlinear recurrence with normalization and residual connections.
 
 **Sub-steps (`--ode-unfolds N`).** One `dt=1` tick is divided into `N`
 sub-steps of `dt/N`. More sub-steps improve the ODE approximation but increase
@@ -380,16 +388,21 @@ tripled into three banks:
 |---|---|---|
 | fast | `softplus(r₀ − 2) + 0.05` | Fast dynamics |
 | medium | `softplus(r₁) + 0.01` | Medium dynamics |
-| slow | `softplus(r₂ + 2) + 0.001` | Slow, long memory |
+| slow | `softplus(r₂ + 2) + 0.001` | Larger initial offset |
 
 The final `τ = Σ wᵢ · τᵢ`, where `w = softmax(tau_mix)` contains three learned
-global (not per-channel) weights.
+global (not per-channel) weights. The banks produce one effective time constant
+per channel and share one recurrent state. They are not independent memory
+states; their ordering and long memory are not guaranteed after training.
 
 ### LiquidCell — `cfc` mode
 
-Closed-form formula from Hasani et al., *Closed-form Continuous-time Neural
-Networks* (Nature Machine Intelligence, 2022). There is no explicit ODE; the
-network directly parameterizes the solution.
+Interpolation inspired by Hasani et al., *Closed-form Continuous-time Neural
+Networks* (Nature Machine Intelligence, 2022). The author's
+[reference implementation](https://github.com/raminmh/CfC/blob/main/torch_cfc.py)
+uses a shared nonlinear backbone before its candidate/time heads. This project
+uses direct projections from `[x, h]`, so it is a simplified variant. There is
+no numerical ODE solver in this branch.
 
 ```
 ff1 = tanh(W₁ₓ·x + W₁ₕ·h)
@@ -401,14 +414,14 @@ h_new = ff1 · (1 − t) + t · ff2
 This has less inductive bias toward decay and more freedom in trajectory shape.
 `--multi-tau` and `--ode-solver` are ignored in this mode (there is no `τ` or
 ODE); `--ode-unfolds > 1` is allowed and composes interpolation over smaller
-`dt`. Initializing `time_net.bias = 0` gives the neutral starting value
-`t = 0.5`.
+`dt`. `time_net.bias` starts at zero; the gate is `t = 0.5` when its total
+preactivation is zero, rather than being fixed at 0.5 for every initial input.
 
 ### Cell output and state normalization
 
-The new layer state is `LayerNorm(Dropout(h))`. Thus the state carried between
-time steps is **normalized**, deliberately stabilizing dynamics on long
-sequences.
+The new layer state is `norm(Dropout(h))`, with LayerNorm by default or optional
+RMSNorm. The state carried between time steps is **normalized**, so the full
+recurrence also depends on this transformation.
 
 **Zoneout (`--zoneout`).** During training, some output elements are replaced
 with the normalized previous state, regularizing abrupt state changes.
@@ -571,10 +584,11 @@ across the window. Measure on your own dimensions before relying on it.
 
 ### Distillation (`--teacher-checkpoint`)
 
-`loss = (1−α)·CE + α·T²·KL(student‖teacher)`, where `α = --kd-alpha` and
-`T = --kd-temperature`. Teacher and student vocabularies must match. The teacher
-is called **without carrying hidden state** between sub-chunks, so its soft
-labels are less informative for the second and later sub-chunks.
+`loss = (1−α)·CE + α·T²·KL(teacher‖student)`, where `α = --kd-alpha` and
+`T = --kd-temperature`. Teacher and student tokenizers must have identical token
+IDs and configurations. The teacher carries hidden state and ChunkMemory across
+sub-chunks, resetting both at the start of each span. Top-k KD computes the tail
+in log space to preserve gradients for highly confident predictions.
 
 ### Early stopping and saving
 
@@ -599,9 +613,12 @@ tensorboard --logdir runs
 
 ### Stability safeguards
 
-Loss is checked for NaN/Inf (fp16 skips are handled by GradScaler), gradients
-can be clipped by norm (`--grad-clip`, 0 disables clipping), and divergence
-causes a clear error.
+Loss and gradients are checked for NaN/Inf before unscaled optimizer updates,
+including with `--grad-clip 0`. FP16 overflow skips are handled by GradScaler;
+the scheduler, global step and EMA advance only after successful updates.
+Sampling options are validated before training starts. Checkpoints use a
+temporary file and atomic replacement, preserving the previous file on a failed
+write and creating missing parent directories.
 
 ## Generation and chat
 
@@ -617,6 +634,10 @@ The prompt is processed and tokens are selected one at a time. The order is:
 repetition penalty → temperature division → top-k → top-p → sampling.
 Generation stops at `<|end|>` (when present) or at `--generate`. State and the
 convolution buffer are carried, so every new token costs O(1).
+
+Prompt processing projects only the final position into vocabulary logits;
+all prompt tokens still pass through the recurrent layers. The regular training
+`forward` output is unchanged.
 
 | Parameter | Effect |
 |---|---|
@@ -657,26 +678,26 @@ architecture and tokenizer are read from the checkpoint itself.
 
 ## Triton kernel (experimental)
 
-`--kernel triton` replaces the LTC sub-step tail (per-bank softplus, mixing,
-`exp`, and the `h` update) with one fused kernel instead of about eight
-elementwise PyTorch operations. Matrix multiplications remain on cuBLAS.
+`--kernel triton` fuses the two LTC add/tanh activations and their first-order
+backward, including gradients for the two recurrent projection slices. The
+Euler update uses a separate fused forward/backward kernel. In multi-tau mode,
+each CUDA program writes only three partial mixing-weight gradient sums.
+The mixing softmax and normalization remain in PyTorch. Matrix
+multiplications remain on cuBLAS. These implementation changes preserve model
+parameters, checkpoint keys, dropout, zoneout and normalization behavior.
+FP16/BF16 additions and intermediate tanh-backward operations retain PyTorch's
+rounding; the implementation does not claim bitwise equivalence across backends.
 
-Requirements:
-
-- **Inference only** (`generate`, chat, `evaluate`); the kernel has no backward.
-- CUDA and an installed `triton`.
-- `--gate-mode ltc --ode-solver euler`.
-
-Otherwise the program prints the reason and stays on the PyTorch path. Check
-correctness and speed on your GPU first:
-
-```bash
-python liquid_text_model.py --selftest-triton
-```
-
-The test compares the kernel with PyTorch (single and multi-tau modes,
-non-uniform bank weights, and “hard” inputs), uses tolerance `1e-4`, and
-measures step time.
+Requirements: CUDA, a Triton package compatible with the local PyTorch build,
+and `--gate-mode ltc --ode-solver euler`. Selecting Triton uses the eager
+recurrent step instead of `torch.compile`; compare full-model tokens/sec for
+both paths before long training runs. Run `--selftest-triton` and
+`python benchmark_triton_tail.py --batch-size 64 --hidden-size 384 --dtype bf16`
+for a forward selftest and an isolated forward/backward tail benchmark. The
+selftest exits with code 2 on a numerical mismatch. Run
+`python tests/check_triton_mixed.py --output runs/triton_correctness.json` for
+mixed-dtype and full-model gradient comparisons, and `benchmark_gpu.py` for
+model-level timings. Windows was tested with `triton-windows 3.8.0.post28`.
 
 ## CLI parameter reference
 
@@ -742,7 +763,7 @@ measures step time.
 | `--ncp-command-frac` | `0.4` | Fraction of command neurons |
 | `--ncp-motor-frac` | `0.2` | Fraction of motor neurons |
 | `--memory-slots` | `0` | ChunkMemory slots (0 disables it) |
-| `--kernel` | `torch` | `torch` or `triton` (inference) |
+| `--kernel` | `torch` | `torch` or experimental `triton` (LTC Euler inference/training) |
 | `--grad-checkpoint` / `--no-grad-checkpoint` | disabled | Gradient checkpointing |
 
 ### Optimization
@@ -997,13 +1018,13 @@ The model is recurrent, so the time loop is sequential:
 - With `--kd-topk > 0`, distillation represents the teacher's probability mass
   outside top-k as a tail bucket; `--kd-topk 0` enables full-vocabulary KL,
   with greater memory and compute cost.
-- Distillation calls the teacher without carrying state between sub-chunks.
-- The Triton kernel supports inference and `ltc + euler` only.
+- Triton supports `ltc + euler` inference and first-order training backward;
+  CfC and Heun use the PyTorch path.
 - NCP reproduces connection topology, not the original paper's synapse
   biophysics; ChunkMemory follows the general M-CfC idea, not its formulas.
 - Cell-level gradient checkpointing may not save memory.
-- Sequential processing is slower than a transformer on long training batches
-  (but faster during generation).
+- The Python recurrent loop limits long-sequence throughput. Measure the intended
+  batch size, hidden size and backend when comparing CPU/GPU performance.
 - The char tokenizer does not support dialogue tags, loss masking, or anchors.
 - Validation is the corpus tail and can be unrepresentative with few files and
   `--no-shuffle-files`.
@@ -1050,7 +1071,14 @@ liquid_lm/
 requirements.txt              # Python dependencies
 
 tests/
-└── test_regressions.py       # regression tests added by this audit
+├── test_regressions.py       # sequence, masking, resume and numerical regressions
+├── test_audit.py             # KD, checkpoint writes, prefill and AMP state
+├── test_gpu.py               # CUDA parity, AMP, scaler and checkpoint tests
+├── test_triton_fusions.py    # fused activations, AMP rounding and optimizer parity
+└── check_triton_mixed.py     # standalone mixed-dtype/full-model Triton checks
+benchmark_model.py            # CPU forward/backward, generation and KD
+benchmark_gpu.py              # synchronized CPU/CUDA/Triton/compiled comparisons
+benchmark_triton_tail.py       # isolated LTC tail forward/backward
 .github/workflows/
 └── tests.yml                 # CPU test workflow
 ```
@@ -1071,10 +1099,84 @@ missing package never breaks unrelated parts of the program.
    checkpoints remain compatible.
 4. Pass the parameter to `create_model_from_config` in `liquid_lm/model.py`.
 
+## Tests and measured results
+
+```bash
+python -m unittest discover -s tests -v
+python benchmark_gpu.py --device both --cases train_realistic16 generate128 --precisions fp32 --threads 1 --warmup 3 --repeats 7 --output runs/benchmark_torch.json
+```
+
+On **19 October 2026**, the current full suite passed **53 tests without skips** on
+Windows 11, Python 3.12.10, PyTorch 2.11.0+cu128, driver 616.56 and an
+**RTX 5050 Laptop 8 GB**, including five checkpoint-averaging tests. The current
+CPU-only run with PyTorch 2.14.1 passed 39 and skipped 14 CUDA/Triton checks
+(53 discovered). Both suites pass without local datasets. The initial audit
+passed 13 GPU CLI scenarios and 2 compiled
+CLI scenarios. Activation fusion was also checked with 18 Triton numerical
+comparisons and 5 focused CLI scenarios. These checks cover
+LTC/CfC, dense/NCP, AMP, AdamW/Muon, overflow, memory, resume, BPE dialogs and KD.
+
+A matched-token continuation experiment measured a small quality
+gain at the same 2.47M parameters: additional training plus uniform averaging
+reduced fixed-window validation NLL from 3.473696 to 3.459669 (perplexity
+32.2557 to 31.8065). Increasing the training horizon from 64 to 128 did not
+beat paired controls on either seed. These are results on reused Shakespeare
+validation, without an independent test set. CONTRIBUTING describes the
+experiment settings and the `research_liquid.py` runner.
+
+Initial CUDA audit, before activation fusion: FP32 medians after
+3 warmups and 7 measured iterations (Triton fused only the LTC tail):
+
+| Workload | CPU, 1 thread | CUDA eager | CUDA Triton | CUDA compiled |
+|---|---:|---:|---:|---:|
+| Training step, B=16, T=64 | 2293.1 ms | 939.9 ms | 204.9 ms | 135.8 ms |
+| Generation, prompt=128 + 32 new tokens, B=1 | 484.5 ms | 234.3 ms | 158.2 ms | 104.7 ms |
+
+Both workloads use synthetic inputs, matching seeds and initial weights,
+LTC/dense Euler, H=embedding=384, L=2, V=8000, multi-tau/local convolution on,
+dropout=zoneout=0, no FFN or ChunkMemory. CPU intra-op/inter-op threads are 1,
+TF32 is off, and CUDA timings synchronize both boundaries. Training includes
+forward, CE, backward and AdamW; generation includes prompt processing and decoding.
+Imports, setup, transfers and JIT warmup are excluded. First compilation can take
+minutes. Smaller models can be faster on CPU; FP16 showed substantial variance,
+and AMP did not automatically improve speed or memory. These short runs verify
+functionality, not answer quality or long-training stability.
+
+Activation-fusion follow-up on the same GPU: median paired speedups over the
+previous tail-only Triton implementation:
+
+| Precision | Dropout/zoneout off | Default dropout=0.05, zoneout=0.1 |
+|---|---:|---:|
+| FP32 | 1.048× | 1.003× |
+| BF16 | 1.037× | 1.054× |
+| FP16 | 1.018× | 1.031× |
+
+These compare full training steps at B=16, T=64, H=384, L=2, V=8000, with
+3 warmups and 12 measurements per version, alternating in ABBA order in one
+process. Losses and final parameters matched after 15 updates in all six cases.
+Timing variation remains substantial; the regularized FP32 result is within
+noise. See the detailed timings and methodology in CONTRIBUTING.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for test coverage, benchmark commands and
+guidelines for reporting new measurements. Fresh benchmark results are written
+to the ignored `runs/` directory.
+
 ## Change history
 
 The project is currently **v3.7**. See the repository history and checkpoint
 compatibility notes above for details of behavior that changed between versions.
+
+### 19 October 2026: numerical fixes and CUDA validation
+
+- Fixed saturated-logit top-k KD gradients, nonfinite-gradient handling and
+  CfC AMP state reads through ChunkMemory.
+- Checkpoint writes preserve the previous file after a write failure; prompt
+  generation avoids projecting unused positions; invalid sampling settings fail early.
+- Added CPU/CUDA regressions and reproducible benchmarks without changing the
+  model architecture, parameter names or checkpoint architecture keys.
+- Verified the CUDA, Triton and compiled paths on an RTX 5050 Laptop GPU.
+- Fused LTC activation forward/backward into the Triton
+  path; added a full-step benchmark with the default dropout and zoneout.
 
 ## Sources and inspiration
 

@@ -4,15 +4,25 @@ __pycache__/
 .venv/
 venv/
 
-# Обучение: чекпоинты, логи, данные
+# Training: checkpoints, logs and data
 *.pt
 *.pth
 runs/
 wandb/
 data/
+data_shakespeare/
 tokenizer*.json
 
-# Редакторы / ОС
+# Local patch backups
+.liquid_triton_v2_backup_*/
+
+# Local commit message draft
+/COMMIT_MESSAGE.txt
+
+# Local research reports and measurements
+/docs/
+
+# Editors / OS
 .idea/
 .vscode/
 .DS_Store
