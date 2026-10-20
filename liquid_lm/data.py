@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import random
+import os
 import re
 from pathlib import Path
 
@@ -72,91 +72,6 @@ EXAMPLE_END_TAG = "<|end|>"
 
 
 DIALOGUE_SPECIAL_TOKENS = [USER_TAG, BOT_TAG, SYSTEM_TAG, EXAMPLE_END_TAG]
-
-
-# ---------------------------------------------------------------------------
-# Fill-in-the-middle (FIM)
-# ---------------------------------------------------------------------------
-
-
-FIM_PREFIX_TAG = "<|fim_prefix|>"
-
-
-FIM_SUFFIX_TAG = "<|fim_suffix|>"
-
-
-FIM_MIDDLE_TAG = "<|fim_middle|>"
-
-
-FIM_SPECIAL_TOKENS = [FIM_PREFIX_TAG, FIM_SUFFIX_TAG, FIM_MIDDLE_TAG]
-
-
-# Code files are read only when FIM is enabled (--fim-rate > 0); FIM is applied
-# only to them. Plain text/dialogue files are never rearranged.
-CODE_SUFFIXES = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".c", ".h", ".cpp",
-    ".hpp", ".cs", ".go", ".rs", ".php", ".rb", ".sh", ".sql", ".html", ".css",
-}
-
-
-FIM_CHUNK_CHARS = 3000
-FIM_MIN_CHUNK_CHARS = 16
-
-
-def _stable_rng(*parts) -> random.Random:
-    """Deterministic RNG derived from the parts (independent of PYTHONHASHSEED
-    and of the global seed), so the same corpus always yields the same FIM
-    rearrangement and the same corpus_sha256."""
-    digest = hashlib.sha256("\x00".join(str(p) for p in parts).encode("utf-8")).digest()
-    return random.Random(int.from_bytes(digest[:8], "big"))
-
-
-def _split_into_line_chunks(text: str, max_chars: int) -> list[str]:
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-    for line in text.split("\n"):
-        add = len(line) + 1
-        if current and current_len + add > max_chars:
-            chunks.append("\n".join(current))
-            current, current_len = [], 0
-        current.append(line)
-        current_len += add
-    if current:
-        chunks.append("\n".join(current))
-    return chunks
-
-
-def apply_fim(
-    text: str, rate: float, key: str, chunk_chars: int = FIM_CHUNK_CHARS,
-) -> tuple[str, int, int]:
-    """Splits `text` into ~chunk_chars chunks on line boundaries and, with
-    probability `rate` per chunk, rewrites a chunk in PSM order:
-
-        <|fim_prefix|>PREFIX<|fim_suffix|>SUFFIX<|fim_middle|>MIDDLE<|end|>
-
-    where PREFIX/MIDDLE/SUFFIX come from two random character cut points of the
-    chunk. <|end|> after the middle lets the model learn where an infill stops
-    (it is also a default stop token for generation).
-    Returns (new_text, number_of_fim_chunks, total_chunks)."""
-    if rate <= 0.0 or not text:
-        return text, 0, 0
-    out: list[str] = []
-    n_fim = 0
-    chunks = _split_into_line_chunks(text, chunk_chars)
-    for i, chunk in enumerate(chunks):
-        rng = _stable_rng("fim", key, i)
-        if len(chunk) >= FIM_MIN_CHUNK_CHARS and rng.random() < rate:
-            a, b = sorted(rng.sample(range(len(chunk) + 1), 2))
-            prefix, middle, suffix = chunk[:a], chunk[a:b], chunk[b:]
-            out.append(
-                f"{FIM_PREFIX_TAG}{prefix}{FIM_SUFFIX_TAG}{suffix}"
-                f"{FIM_MIDDLE_TAG}{middle}{EXAMPLE_END_TAG}"
-            )
-            n_fim += 1
-        else:
-            out.append(chunk)
-    return "\n".join(out), n_fim, len(chunks)
 
 
 _ROLE_TAG_BY_NAME = {
@@ -229,7 +144,7 @@ def dialogue_obj_to_text(obj) -> str | None:
 
 def json_to_text(path: Path) -> str:
     try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
+        obj = json.loads(path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return ""
     if isinstance(obj, list):
@@ -246,7 +161,7 @@ def json_to_text(path: Path) -> str:
     dialogue = dialogue_obj_to_text(obj)
     if dialogue:
         return dialogue + f"\n{EXAMPLE_END_TAG}"
-    return json.dumps(obj, ensure_ascii=False, indent=2)
+    return _extract_text_from_obj(obj)
 
 
 def _extract_text_from_obj(obj) -> str:
@@ -275,7 +190,7 @@ def _extract_text_from_obj(obj) -> str:
 def jsonl_to_text(path: Path) -> str:
     lines_out: list[str] = []
     try:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             for raw_line in f:
                 raw_line = raw_line.strip()
                 if not raw_line:
@@ -290,6 +205,8 @@ def jsonl_to_text(path: Path) -> str:
                     lines_out.append(dialogue + f"\n{EXAMPLE_END_TAG}")
                 else:
                     lines_out.append(_extract_text_from_obj(obj))
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"JSONL must be valid UTF-8: {path}") from exc
     except OSError:
         return ""
     return "\n\n".join(lines_out)
@@ -362,6 +279,14 @@ def tabular_to_text(path: Path, sep: str) -> str:
 
 
 def read_text_robust(path: Path) -> tuple[str, str | None]:
+    # UTF-8 is the common case. Avoid statistical detection (and a second read)
+    # for valid Unicode; utf-8-sig also removes an optional leading BOM.
+    try:
+        return path.read_text(encoding="utf-8-sig"), "utf-8-sig"
+    except UnicodeDecodeError:
+        pass
+    except OSError:
+        return "", None
     if _HAS_CHARSET_NORMALIZER:
         try:
             best = _charset_from_path(path).best()
@@ -405,18 +330,18 @@ def load_one_file(path: Path) -> tuple[str, str | None]:
 def load_texts(
     data_dir: Path, min_chars: int = 200, max_file_mb: float = 0.0,
     shuffle_files: bool = False, file_headers: bool = True,
-    fim_rate: float = 0.0,
 ) -> str:
     data_dir.mkdir(parents=True, exist_ok=True)
-    scan_suffixes = SUPPORTED_SUFFIXES | CODE_SUFFIXES if fim_rate > 0.0 else SUPPORTED_SUFFIXES
-    all_candidates = (
-        p for p in data_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in scan_suffixes
-    )
-    files = sorted(
-        p for p in all_candidates
-        if not any(part in EXCLUDED_DIR_NAMES for part in p.relative_to(data_dir).parts)
-    )
+    # Prune before descending: filtering rglob results still walks all of a
+    # virtual environment or node_modules tree inside a dataset directory.
+    files = []
+    for root, directories, names in os.walk(data_dir):
+        directories[:] = [d for d in directories if d not in EXCLUDED_DIR_NAMES]
+        for name in names:
+            path = Path(root) / name
+            if path.suffix.lower() in SUPPORTED_SUFFIXES and path.is_file():
+                files.append(path)
+    files.sort()
     if not files:
         raise ValueError(
             f"В {data_dir} нет файлов корпуса ({', '.join(sorted(SUPPORTED_SUFFIXES))}). "
@@ -438,8 +363,6 @@ def load_texts(
     skipped_duplicate: list[str] = []
     low_confidence_encodings: list[str] = []
     used_files = 0
-    fim_chunks = 0
-    fim_total_chunks = 0
     for path in files:
         suffix = path.suffix.lower()
         bucket = stats_by_suffix.setdefault(suffix, {"files": 0, "chars": 0})
@@ -465,12 +388,6 @@ def load_texts(
             skipped_duplicate.append(str(path))
             continue
         seen_hashes.add(digest)
-        if fim_rate > 0.0 and suffix in CODE_SUFFIXES:
-            text, n_fim, n_chunks = apply_fim(
-                text, fim_rate, key=path.relative_to(data_dir).as_posix(),
-            )
-            fim_chunks += n_fim
-            fim_total_chunks += n_chunks
         if file_headers:
             parts.append(f"\n\n===== {path.name} =====\n\n{text}")
         else:
@@ -488,13 +405,6 @@ def load_texts(
         s = stats_by_suffix[suffix]
         if s["files"]:
             print(f"[DATA]   {suffix}: {s['files']} файлов, {s['chars']:,} символов")
-    if fim_rate > 0.0:
-        print(
-            f"[DATA] FIM (rate={fim_rate}): {fim_chunks:,} из {fim_total_chunks:,} "
-            f"фрагментов кода переписаны в PSM-формат."
-        )
-        if fim_total_chunks == 0:
-            print("[DATA] ВНИМАНИЕ: --fim-rate задан, но файлов с кодом не найдено.")
     if skipped_too_large:
         print(f"[DATA] Пропущено (больше {max_file_mb:.0f} MB): {len(skipped_too_large)}")
     if skipped_empty:

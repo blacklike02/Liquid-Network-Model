@@ -8,7 +8,7 @@ from pathlib import Path
 from .data import BOT_TAG, EXAMPLE_END_TAG, USER_TAG
 from .model import (
     create_model_from_config,
-    load_checkpoint_raw,
+    load_inference_checkpoint,
     load_model_state_compat,
     print_checkpoint_info,
 )
@@ -17,13 +17,14 @@ from .utils import cuda_memory_report
 
 
 def run_chat_repl(args, device):
-    checkpoint = load_checkpoint_raw(Path(args.checkpoint), device)
+    checkpoint = load_inference_checkpoint(Path(args.checkpoint))
     print_checkpoint_info(checkpoint)
     tokenizer = tokenizer_from_checkpoint(checkpoint)
     model = create_model_from_config(
         vocab_size=tokenizer.vocab_size, config=checkpoint["config"], device=device,
     )
-    load_model_state_compat(model, checkpoint["model_state"])
+    load_model_state_compat(model, checkpoint.pop("model_state"))
+    model.set_sequence_batching(getattr(args, "sequence_batching", False))
     model.eval()
     if args.kernel != "torch":
         model.set_kernel(args.kernel)
@@ -71,13 +72,14 @@ def run_generate_only(args, device):
     if args.chat_repl:
         run_chat_repl(args, device)
         return
-    checkpoint = load_checkpoint_raw(Path(args.checkpoint), device)
+    checkpoint = load_inference_checkpoint(Path(args.checkpoint))
     print_checkpoint_info(checkpoint)
     tokenizer = tokenizer_from_checkpoint(checkpoint)
     model = create_model_from_config(
         vocab_size=tokenizer.vocab_size, config=checkpoint["config"], device=device,
     )
-    load_model_state_compat(model, checkpoint["model_state"])
+    load_model_state_compat(model, checkpoint.pop("model_state"))
+    model.set_sequence_batching(getattr(args, "sequence_batching", False))
     model.eval()
     if args.kernel != "torch":
         model.set_kernel(args.kernel)

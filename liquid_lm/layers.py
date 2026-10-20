@@ -1,4 +1,4 @@
-"""Liquid model layers: dropout, Triton kernel, NCP, liquid cell and chunk memory."""
+"""Liquid model layers: dropout, Triton kernel, liquid cell and chunk memory."""
 
 from __future__ import annotations
 
@@ -37,12 +37,11 @@ class LockedDropout(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-NORM_TYPES = ("layer", "rms")
-
-
 class RMSNorm(nn.Module):
-    """RMSNorm (no mean subtraction, no bias). Statistics are computed in
-    float32 regardless of the autocast dtype."""
+    """RMSNorm without mean subtraction or bias.
+
+    FP16/BF16 use FP32 statistics; explicit FP64 inputs retain FP64 precision.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -50,17 +49,22 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xf = x.float()
-        out = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return (out * self.weight.float()).to(x.dtype)
+        # Prefer the native operation; keep FP32 statistics for AMP.
+        compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        xf, weight = x.to(compute_dtype), self.weight.to(compute_dtype)
+        if hasattr(F, "rms_norm"):
+            out = F.rms_norm(xf, (self.weight.numel(),), weight, self.eps)
+        else:  # PyTorch 2.0-2.3 compatibility.
+            out = xf * (xf.square().mean(-1, keepdim=True) + self.eps).rsqrt() * weight
+        return out.to(x.dtype)
 
 
 def make_norm(kind: str, dim: int) -> nn.Module:
-    if kind == "layer":
-        return nn.LayerNorm(dim)
-    if kind == "rms":
-        return RMSNorm(dim)
-    raise ValueError(f"Неизвестный norm_type: {kind!r} (ожидался 'layer' или 'rms')")
+    # Keep the keyword for Python callers/checkpoint metadata, not as a choice.
+    if kind != "rms":
+        raise ValueError("Only RMSNorm is supported (norm_type='rms'). "
+                         "LayerNorm has been retired; use an earlier revision for its checkpoints.")
+    return RMSNorm(dim)
 
 
 class ResidualFFN(nn.Module):
@@ -82,7 +86,7 @@ class ResidualFFN(nn.Module):
         self,
         dim: int,
         mult: float,
-        norm_type: str = "layer",
+        norm_type: str = "rms",
         dropout: float = 0.0,
         num_layers: int = 1,
     ) -> None:
@@ -388,124 +392,26 @@ def _ltc_tail_triton_autograd(h, candidate, tau_raw, mix_w, sub_dt, min_tau, mul
     return _ltc_tail_triton(h, candidate, tau_raw, mix_w, sub_dt, min_tau, multi_tau)
 
 # ---------------------------------------------------------------------------
-# NCP recurrent matrix
-# ---------------------------------------------------------------------------
-
-
-class NCPRecurrent(nn.Module):
-    """
-    A block-structured replacement for ONE dense (H,H) recurrent matrix
-    (h_proj in the ltc gate, ff1_h/ff2_h in cfc) — in the spirit of Neural
-    Circuit Policies (Lechner et al., "Neural circuit policies enabling
-    auditable autonomy", Nature MI 2020): neurons are split into
-    inter/command/motor, and connections are allowed only along the paths
-
-        inter   -> inter    (recurrent)
-        inter   -> command
-        command -> command  (recurrent)
-        command -> motor
-        motor   -> command  (feedback, closes the loop)
-
-    Each allowed path has its own SEPARATE, physically SMALLER matrix
-    (nn.Linear over inter_size/command_size/motor_size, not hidden_size).
-    A mask over a dense matrix in PyTorch gives no speedup — an ordinary
-    dense matmul still computes all H*H products. Here the nonexistent
-    connections are simply NOT there, neither in the weights nor in the
-    computation — a real, not "on paper", reduction of both parameters and
-    FLOPs.
-
-    Within each allowed path the connections are still FULLY CONNECTED (not
-    pruned element-wise).
-
-    NOTE (a deliberate simplification): synapse polarity (excitatory/
-    inhibitory via the reversal potential in the sigmoidal conductance from
-    the original LTC biophysics) is not reproduced — the sign and magnitude
-    of the weights on the allowed connections are still learned freely by
-    gradient descent.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        command_frac: float = 0.4,
-        motor_frac: float = 0.2,
-    ) -> None:
-        super().__init__()
-        if hidden_size < 3:
-            raise ValueError("--wiring ncp requires hidden_size >= 3")
-        if not (0.0 < command_frac < 1.0) or not (0.0 < motor_frac < 1.0):
-            raise ValueError("--ncp-command-frac and --ncp-motor-frac must be in (0, 1)")
-        if command_frac + motor_frac >= 1.0:
-            raise ValueError("--ncp-command-frac + --ncp-motor-frac must be < 1")
-
-        motor_size = max(1, round(hidden_size * motor_frac))
-        command_size = max(1, round(hidden_size * command_frac))
-        inter_size = hidden_size - motor_size - command_size
-        if inter_size < 1:
-            raise ValueError(
-                f"hidden_size={hidden_size} слишком мал для "
-                f"ncp_motor_frac={motor_frac}, ncp_command_frac={command_frac}"
-            )
-
-        self.hidden_size = hidden_size
-        self.inter_size = inter_size
-        self.command_size = command_size
-        self.motor_size = motor_size
-
-        self.w_ii = nn.Linear(inter_size, inter_size, bias=False)
-        self.w_ic = nn.Linear(inter_size, command_size, bias=False)
-        self.w_cc = nn.Linear(command_size, command_size, bias=False)
-        self.w_cm = nn.Linear(command_size, motor_size, bias=False)
-        self.w_mc = nn.Linear(motor_size, command_size, bias=False)  # feedback
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        for lin in (self.w_ii, self.w_ic, self.w_cc, self.w_cm, self.w_mc):
-            nn.init.orthogonal_(lin.weight, gain=0.99)
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        h_inter, h_command, h_motor = torch.split(
-            h, [self.inter_size, self.command_size, self.motor_size], dim=-1
-        )
-        inter_out = self.w_ii(h_inter)
-        command_out = self.w_ic(h_inter) + self.w_cc(h_command) + self.w_mc(h_motor)
-        motor_out = self.w_cm(h_command)
-        return torch.cat([inter_out, command_out, motor_out], dim=-1)
-
-    @property
-    def param_fraction(self) -> float:
-        """Fraction of parameters/FLOPs relative to the full dense H x H matrix."""
-        H, Hi, Hc, Hm = self.hidden_size, self.inter_size, self.command_size, self.motor_size
-        used = Hi * Hi + Hi * Hc + Hc * Hc + 2 * Hc * Hm
-        return used / (H * H)
-
-
-# ---------------------------------------------------------------------------
 # Liquid cell
 # ---------------------------------------------------------------------------
 
 
+def validate_retired_architecture(ode_unfolds=1, ode_solver="euler", wiring="dense"):
+    """Reject retired equations instead of silently changing old checkpoints."""
+    for name, value, supported in (("ode_unfolds", ode_unfolds, 1),
+                                   ("ode_solver", ode_solver, "euler"),
+                                   ("wiring", wiring, "dense")):
+        if value != supported:
+            raise ValueError(f"{name}={value!r} is retired; only {supported!r} is supported. "
+                             "Use the earlier repository revision for this checkpoint.")
+
+
 class LiquidCell(nn.Module):
-    """
-    Two gate modes (gate_mode):
+    """Dense recurrent LTC exponential update or simplified closed-form CfC.
 
-    - "ltc" (default): a physically motivated linear ODE
-      dh/dt = (candidate - h) / tau, with candidate and tau "frozen" over the
-      substep and solved exactly (exponential integrator). Within a substep,
-      candidate/tau are computed either once at the start of the substep
-      (ode_solver="euler") or twice with averaging (ode_solver="heun" —
-      predictor-corrector, second-order accuracy; twice as expensive per
-      substep).
-
-    - "cfc": the closed-form formula from Hasani et al., "Closed-form
-      Continuous-time Neural Networks" (Nature Machine Intelligence, 2022):
-      two state candidates (ff1, ff2) and a learnable sigmoid interpolation
-      over time between them. With gate_mode="cfc" the --multi-tau parameter
-      is meaningless (there is no tau) and is ignored.
-
-    wiring="dense" (default) — an ordinary fully connected recurrent
-    matrix. wiring="ncp" — the same matrix is replaced by NCPRecurrent.
-    In cfc mode, ff1_h and ff2_h are two independent NCPRecurrent instances.
+    The LTC candidate/time constant are evaluated once per token. Retired
+    architecture arguments accept only their former baseline values so old
+    baseline callers retain their exact equations and weight layout.
     """
 
     def __init__(
@@ -520,50 +426,32 @@ class LiquidCell(nn.Module):
         gate_mode: str = "ltc",
         ode_solver: str = "euler",
         wiring: str = "dense",
-        ncp_command_frac: float = 0.4,
-        ncp_motor_frac: float = 0.2,
-        norm_type: str = "layer",
+        norm_type: str = "rms",
     ) -> None:
         super().__init__()
-        if ode_unfolds < 1:
-            raise ValueError("ode_unfolds must be >= 1")
+        validate_retired_architecture(ode_unfolds, ode_solver, wiring)
         if input_size < 1 or hidden_size < 1:
             raise ValueError("input_size and hidden_size must be > 0")
         if gate_mode not in ("ltc", "cfc"):
             raise ValueError(f"Неизвестный gate_mode: {gate_mode!r} (ожидался 'ltc' или 'cfc')")
-        if ode_solver not in ("euler", "heun"):
-            raise ValueError(f"Неизвестный ode_solver: {ode_solver!r} (ожидался 'euler' или 'heun')")
-        if wiring not in ("dense", "ncp"):
-            raise ValueError(f"Неизвестный wiring: {wiring!r} (ожидался 'dense' или 'ncp')")
 
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.ode_unfolds = ode_unfolds
         self.min_tau = min_tau
         self.zoneout = zoneout
         self.gate_mode = gate_mode
-        self.ode_solver = ode_solver
-        self.wiring = wiring
         self.kernel = "torch"
         self.multi_tau = bool(multi_tau) and gate_mode == "ltc"
-        self._inv_unfolds = 1.0 / ode_unfolds
 
         if gate_mode == "cfc":
             self.ff1_x = nn.Linear(input_size, hidden_size)
             self.ff2_x = nn.Linear(input_size, hidden_size)
-            if wiring == "ncp":
-                self.ff1_h_ncp = NCPRecurrent(hidden_size, ncp_command_frac, ncp_motor_frac)
-                self.ff2_h_ncp = NCPRecurrent(hidden_size, ncp_command_frac, ncp_motor_frac)
-            else:
-                self.ff1_h = nn.Linear(hidden_size, hidden_size, bias=False)
-                self.ff2_h = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.ff1_h = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.ff2_h = nn.Linear(hidden_size, hidden_size, bias=False)
             self.time_net = nn.Linear(input_size + hidden_size, hidden_size * 2)
         else:
             self.x_proj = nn.Linear(input_size, hidden_size)
-            if wiring == "ncp":
-                self.h_proj_ncp = NCPRecurrent(hidden_size, ncp_command_frac, ncp_motor_frac)
-            else:
-                self.h_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.h_proj = nn.Linear(hidden_size, hidden_size, bias=False)
             tau_out = hidden_size * 3 if self.multi_tau else hidden_size
             self.tau_net = nn.Sequential(
                 nn.Linear(input_size + hidden_size, hidden_size),
@@ -577,28 +465,17 @@ class LiquidCell(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.reset_parameters()
 
-    @property
-    def recurrent_param_fraction(self) -> float | None:
-        """Fraction of parameters/FLOPs of the recurrent matrix relative to the full
-        dense H x H (only for wiring="ncp", otherwise None)."""
-        if self.wiring != "ncp":
-            return None
-        ncp = self.ff1_h_ncp if self.gate_mode == "cfc" else self.h_proj_ncp
-        return ncp.param_fraction
-
     def reset_parameters(self) -> None:
         if self.gate_mode == "cfc":
             for lin in (self.ff1_x, self.ff2_x):
                 nn.init.xavier_uniform_(lin.weight)
                 nn.init.zeros_(lin.bias)
-            if self.wiring != "ncp":
-                for lin in (self.ff1_h, self.ff2_h):
-                    nn.init.orthogonal_(lin.weight, gain=0.99)
+            for lin in (self.ff1_h, self.ff2_h):
+                nn.init.orthogonal_(lin.weight, gain=0.99)
             nn.init.xavier_uniform_(self.time_net.weight)
             nn.init.zeros_(self.time_net.bias)
             return
-        if self.wiring != "ncp":
-            nn.init.orthogonal_(self.h_proj.weight, gain=0.99)
+        nn.init.orthogonal_(self.h_proj.weight, gain=0.99)
         nn.init.xavier_uniform_(self.x_proj.weight)
         nn.init.zeros_(self.x_proj.bias)
         nn.init.xavier_uniform_(self.tau_net[0].weight)
@@ -607,12 +484,7 @@ class LiquidCell(nn.Module):
         nn.init.constant_(self.tau_net[2].bias, 0.1)
 
     def fused_h_weights(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Prepares one large (weight, bias) for a SINGLE F.linear call — only for
-        wiring="dense". With wiring="ncp" the recurrent part is already several
-        physically smaller matmuls with nothing to "glue" them into —
-        _fused_from_h() is used instead, and this method returns (None, None)."""
-        if self.wiring == "ncp":
-            return None, None
+        """Pack recurrent projections once for a single linear operation."""
         H = self.hidden_size
         if self.gate_mode == "cfc":
             fused_w = torch.cat(
@@ -632,26 +504,47 @@ class LiquidCell(nn.Module):
         self, h: torch.Tensor,
         fused_w: torch.Tensor | None, fused_b: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Computes the "fused" projection of the current h: with wiring="dense" — a
-        single F.linear; with wiring="ncp" — via the block-structured
-        NCPRecurrent plus a separate dense matmul for tau/time gating, with the
-        results concatenated into the same (B, 2H) / (B, 4H) layout that
-        _ltc_step/_cfc_step expect."""
-        if self.wiring != "ncp":
-            return F.linear(h, fused_w, fused_b)
-        if self.gate_mode == "cfc":
-            ff1h = self.ff1_h_ncp(h)
-            ff2h = self.ff2_h_ncp(h)
-            time_h = F.linear(h, self.time_net.weight[:, self.input_size:], self.time_net.bias)
-            return torch.cat([ff1h, ff2h, time_h], dim=-1)
-        h_proj_out = self.h_proj_ncp(h)
-        tau_h = F.linear(h, self.tau_net[0].weight[:, self.input_size:], self.tau_net[0].bias)
-        return torch.cat([h_proj_out, tau_h], dim=-1)
+        return F.linear(h, fused_w, fused_b)
 
-    def precompute_x(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def input_projection_weights(self):
+        """Pack input-only affine projections once per sequence, retaining grads.
+
+        In particular, slicing tau/time weights inside every recurrent step
+        creates repeated full-weight scatter gradients. Packing here shares
+        that graph and lets cuBLAS evaluate FP32 input heads in one GEMM.
+        AMP keeps separate GEMMs: a joint low-precision input gradient rounds
+        after summing heads instead of rounding each head before their FP32 sum.
+        """
+        parameter = self.ff1_x.weight if self.gate_mode == "cfc" else self.x_proj.weight
+        if torch.is_autocast_enabled(parameter.device.type) or parameter.dtype in (torch.float16, torch.bfloat16):
+            if self.gate_mode == "cfc":
+                return (self.ff1_x.weight, self.ff1_x.bias, self.ff2_x.weight, self.ff2_x.bias,
+                        self.time_net.weight[:, :self.input_size])
+            return self.x_proj.weight, self.x_proj.bias, self.tau_net[0].weight[:, :self.input_size]
+        if self.gate_mode == "cfc":
+            weight = torch.cat((self.ff1_x.weight, self.ff2_x.weight,
+                                self.time_net.weight[:, :self.input_size]), dim=0)
+            bias = torch.cat((self.ff1_x.bias, self.ff2_x.bias,
+                              self.time_net.bias.new_zeros(2 * self.hidden_size)))
+        else:
+            weight = torch.cat((self.x_proj.weight, self.tau_net[0].weight[:, :self.input_size]), dim=0)
+            bias = torch.cat((self.x_proj.bias, self.x_proj.bias.new_zeros(self.hidden_size)))
+        return weight, bias
+
+    def precompute_x(self, x: torch.Tensor, input_projection=None) -> tuple[torch.Tensor, torch.Tensor]:
         """The part of the projections that depends only on x (not on h) — computed
         once for the whole sequence up front (see
         LiquidLanguageModel.forward) rather than anew at every step."""
+        if input_projection is not None:
+            if len(input_projection) == 3:
+                weight, bias, time_weight = input_projection
+                return F.linear(x, weight, bias), F.linear(x, time_weight)
+            if len(input_projection) == 5:
+                w1, b1, w2, b2, time_weight = input_projection
+                return torch.cat((F.linear(x, w1, b1), F.linear(x, w2, b2)), dim=-1), F.linear(x, time_weight)
+            projected = F.linear(x, *input_projection)
+            width = self.hidden_size * (2 if self.gate_mode == "cfc" else 1)
+            return projected.split(width, dim=-1)
         if self.gate_mode == "cfc":
             xp = torch.cat([self.ff1_x(x), self.ff2_x(x)], dim=-1)
             tx = F.linear(x, self.time_net.weight[:, :self.input_size])
@@ -670,17 +563,16 @@ class LiquidCell(nn.Module):
             and _TRITON_AVAILABLE
             and h.is_cuda
             and self.gate_mode == "ltc"
-            and self.ode_solver == "euler"
         )
     def _ltc_step(
         self, h: torch.Tensor, xp: torch.Tensor, tx: torch.Tensor,
         sub_dt: float, fused_w: torch.Tensor, fused_b: torch.Tensor,
+        mix_w: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One explicit substep of the ltc gate: candidate/tau are evaluated at the
         point h (the start of the substep), then the ODE dh/dt=(candidate-h)/tau
         is solved exactly over this substep with "frozen" candidate/tau.
-        Returns (h_new, candidate, tau) — candidate and tau are needed outside
-        for the heun corrector (see forward)."""
+        Returns the updated state and diagnostic candidate/tau tensors."""
         H = self.hidden_size
         fused = self._fused_from_h(h, fused_w, fused_b)
         use_triton = self._use_triton_tail(h)
@@ -691,7 +583,8 @@ class LiquidCell(nn.Module):
             tau_hidden = torch.tanh(fused[:, H:] + tx)
         tau_raw = self.tau_net[2](tau_hidden)
         if use_triton:
-            mix_w = F.softmax(self.tau_mix, dim=0) if self.multi_tau else None
+            if self.multi_tau and mix_w is None:
+                mix_w = F.softmax(self.tau_mix, dim=0)
             h_new = _ltc_tail_triton_autograd(
                 h, candidate, tau_raw, mix_w, sub_dt, self.min_tau, self.multi_tau
             )
@@ -701,7 +594,7 @@ class LiquidCell(nn.Module):
             tau_fast = F.softplus(tau_raw[:, 0, :] - 2.0) + 0.05
             tau_med = F.softplus(tau_raw[:, 1, :]) + 0.01
             tau_slow = F.softplus(tau_raw[:, 2, :] + 2.0) + 0.001
-            w = F.softmax(self.tau_mix, dim=0)
+            w = F.softmax(self.tau_mix, dim=0) if mix_w is None else mix_w
             tau = w[0] * tau_fast + w[1] * tau_med + w[2] * tau_slow
         else:
             tau = F.softplus(tau_raw) + self.min_tau
@@ -733,27 +626,20 @@ class LiquidCell(nn.Module):
         tx: torch.Tensor | None = None,
         fused_w: torch.Tensor | None = None,
         fused_b: torch.Tensor | None = None,
+        mix_w: torch.Tensor | None = None,
+        input_projection=None,
     ) -> torch.Tensor:
-        sub_dt = dt * self._inv_unfolds
         h_in = h
 
         if xp is None or tx is None:
-            xp, tx = self.precompute_x(x)
-        if self.wiring != "ncp" and (fused_w is None or fused_b is None):
+            xp, tx = self.precompute_x(x, input_projection)
+        if fused_w is None or fused_b is None:
             fused_w, fused_b = self.fused_h_weights()
 
-        for _ in range(self.ode_unfolds):
-            if self.gate_mode == "cfc":
-                h = self._cfc_step(h, xp, tx, sub_dt, fused_w, fused_b)
-            elif self.ode_solver == "heun":
-                h_pred, cand0, tau0 = self._ltc_step(h, xp, tx, sub_dt, fused_w, fused_b)
-                _, cand1, tau1 = self._ltc_step(h_pred, xp, tx, sub_dt, fused_w, fused_b)
-                candidate = 0.5 * (cand0 + cand1)
-                tau = 0.5 * (tau0 + tau1)
-                decay = torch.exp(-sub_dt / tau)
-                h = decay * h + (1.0 - decay) * candidate
-            else:
-                h, _, _ = self._ltc_step(h, xp, tx, sub_dt, fused_w, fused_b)
+        if self.gate_mode == "cfc":
+            h = self._cfc_step(h, xp, tx, dt, fused_w, fused_b)
+        else:
+            h, _, _ = self._ltc_step(h, xp, tx, dt, fused_w, fused_b, mix_w)
 
         out = self.norm(self.dropout(h))
 
@@ -771,32 +657,11 @@ class LiquidCell(nn.Module):
 
 
 class ChunkMemory(nn.Module):
-    """
-    Sliding memory on top of --state-carry: a separate, slower long-term
-    memory channel that is not subject to the exp-decay dynamics of the
-    liquid cell itself. The idea is "explicit persistent memory on top of the
-    ODE state for long sequences" (inspired by M-CfC; the formula from the
-    paper is NOT reproduced), mechanically closest to the Transformer-XL
-    cache memory.
+    """Historical full-width memory retained for existing checkpoint weights.
 
-    At the end of each --state-carry subchunk, the final hidden state of the
-    last liquid layer is pushed into a FIFO buffer (the last --memory-slots
-    summaries; overflow evicts the oldest). At the start of the NEXT
-    subchunk this memory is read via dot-product attention and mixed (through
-    a learnable gate) into the last layer's hidden state that is carried
-    across chunks.
-
-    Between subchunks the hidden state and the buffer are detached (to save
-    GPU memory) — there is no direct gradient across a chunk boundary. The
-    read/write weights are learned from the effect within each individual
-    subchunk.
-
-    The buffer stores RAW (detached) final states, and summarize is applied
-    lazily in read() — so summarize actually receives gradients. The memory
-    only works with --state-carry >= 2.
-
-    Wired into training/evaluate and generation/chat when memory_slots > 0;
-    generation reads/writes summaries at memory_chunk_size token boundaries.
+    Raw detached final states are compressed lazily during reads, so read
+    projections receive gradients within the current chunk. Initial slots are
+    learned. New training uses CompactChunkMemory with explicit occupancy.
     """
 
     def __init__(self, hidden_size: int, memory_slots: int) -> None:
@@ -848,6 +713,64 @@ class ChunkMemory(nn.Module):
     def write(self, h_final: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
         raw = h_final.detach().to(memory.dtype).unsqueeze(1)           # (B,1,H)
         return torch.cat([memory[:, 1:, :], raw], dim=1)               # FIFO shift
+
+
+class CompactChunkMemory(nn.Module):
+    """Low-rank FIFO reads with explicit occupancy and detached raw-state writes.
+
+    Slots retain raw states so the compression weights receive gradients at
+    read time. The last channel records occupancy; empty slots contribute
+    exactly zero, including at the start of a new conversation. No mutable
+    memory lives on the module itself.
+    """
+
+    def __init__(self, hidden_size: int, memory_slots: int, memory_dim: int):
+        super().__init__()
+        if min(hidden_size, memory_slots, memory_dim) < 1:
+            raise ValueError("hidden_size, memory_slots and memory_dim must be positive")
+        self.hidden_size = hidden_size
+        self.memory_slots = memory_slots
+        self.memory_dim = min(memory_dim, hidden_size)
+        dim = self.memory_dim
+        self.summarize = nn.Linear(hidden_size, dim)
+        self.query_proj = nn.Linear(hidden_size, dim, bias=False)
+        self.key_proj = nn.Linear(dim, dim, bias=False)
+        self.read_gate = nn.Linear(hidden_size + dim, dim)
+        self.value_proj = nn.Linear(dim, hidden_size, bias=False)
+        self._scale = dim ** -0.5
+        for module in (self.summarize, self.query_proj, self.key_proj,
+                       self.read_gate, self.value_proj):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        nn.init.constant_(self.read_gate.bias, -2.0)
+
+    def init_memory(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros(batch_size, self.memory_slots, self.hidden_size + 1,
+                           device=device, dtype=self.query_proj.weight.dtype)
+
+    def read(self, h0: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        h0 = h0.to(self.query_proj.weight.dtype)
+        valid = memory[..., -1] > 0
+        # Mask before projection too: invalid payloads cannot influence a read.
+        raw = torch.where(valid.unsqueeze(-1), memory[..., :-1], 0).to(h0.dtype)
+        summaries = torch.tanh(self.summarize(raw))
+        query = self.query_proj(h0).unsqueeze(1)
+        keys = self.key_proj(summaries)
+        scores = (query.float() * keys.float()).sum(-1) * self._scale
+        # A finite sentinel keeps an all-empty row well defined. Re-normalizing
+        # after masking yields zero weights when no slot has been written.
+        weights = scores.masked_fill(~valid, torch.finfo(scores.dtype).min).softmax(-1)
+        weights = weights * valid
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-12)
+        retrieved = (weights.unsqueeze(-1) * summaries.float()).sum(1).to(h0.dtype)
+        gate = torch.sigmoid(self.read_gate(torch.cat((h0, retrieved), -1)))
+        return h0 + self.value_proj(gate * retrieved)
+
+    def write(self, h_final: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        raw = h_final.detach().to(memory.dtype).unsqueeze(1)
+        valid = raw.new_ones(raw.shape[0], 1, 1)
+        return torch.cat((memory[:, 1:], torch.cat((raw, valid), -1)), 1)
 
 
 def chunk_memory_reset(base_model, batch_size: int, device: torch.device):

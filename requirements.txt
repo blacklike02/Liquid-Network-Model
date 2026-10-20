@@ -17,5 +17,5 @@ charset-normalizer  # accurate text-file encoding detection
 # --- Optional (uncomment if needed) ---
 # tensorboard       # --log-backend tensorboard
 # wandb             # --log-backend wandb (run `wandb login` once)
-# triton            # --kernel triton (NVIDIA CUDA, LTC Euler inference/training)
+# triton            # --kernel triton (NVIDIA CUDA, LTC inference/training)
 #                   # Windows: use a compatible triton-windows build instead

@@ -149,7 +149,7 @@ def run_model_case(dtype_name, multi_tau, seq_len, hidden_size):
     torch.manual_seed(180)
     reference = LiquidLanguageModel(
         vocab_size=97, embedding_dim=hidden_size, hidden_size=hidden_size,
-        num_layers=2, ode_unfolds=2, dropout=0., zoneout=0., tie_weights=True,
+        num_layers=2, ode_unfolds=1, dropout=0., zoneout=0., tie_weights=True,
         multi_tau=multi_tau, local_conv=True, gate_mode="ltc", ode_solver="euler",
     ).to("cuda").train()
     if multi_tau:
@@ -200,7 +200,7 @@ def run_model_case(dtype_name, multi_tau, seq_len, hidden_size):
     return {
         "case": f"model_{dtype_name}_multi{int(multi_tau)}", "dtype": dtype_name,
         "multi_tau": multi_tau, "batch_size": 2, "seq_len": seq_len,
-        "hidden_size": hidden_size, "num_layers": 2, "ode_unfolds": 2,
+        "hidden_size": hidden_size, "num_layers": 2, "ode_unfolds": 1,
         "parameter_dtype": "torch.float32", "triton_tail_calls": triton_calls,
         "tail_input_dtype_combinations": sorted(tail_input_dtypes, key=str),
         "reference_loss": expected_loss.item(), "actual_loss": actual_loss.item(),

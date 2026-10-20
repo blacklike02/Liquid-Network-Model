@@ -54,7 +54,7 @@ def main():
         "warmup": args.warmup, "repeats": args.repeats,
         "source_root": str(args.source_root.resolve()), "cases": {},
     }
-    for gate, wiring in (("ltc", "dense"), ("cfc", "dense"), ("ltc", "ncp")):
+    for gate, wiring in (("ltc", "dense"), ("cfc", "dense")):
         torch.manual_seed(1234)
         model = LiquidLanguageModel(
             512, embedding_dim=64, hidden_size=64, num_layers=2,

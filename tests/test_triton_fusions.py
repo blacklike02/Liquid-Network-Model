@@ -95,13 +95,13 @@ class TritonFusionTests(unittest.TestCase):
                 for got, want in zip((*result, *actual_grads), (*expected, *expected_grads)):
                     torch.testing.assert_close(got, want, atol=0, rtol=0)
 
-    def test_regularized_optimizer_steps_match_torch_with_checkpoint_and_ncp(self):
-        for wiring, norm, checkpoint in (("dense", "layer", False), ("ncp", "rms", True)):
+    def test_regularized_optimizer_steps_match_torch_with_checkpoint_and_rms(self):
+        for wiring, norm, checkpoint in (("dense", "rms", False), ("dense", "rms", True)):
             with self.subTest(wiring=wiring, norm=norm, checkpoint=checkpoint):
                 torch.manual_seed(81)
                 reference = LiquidLanguageModel(
                     23, embedding_dim=16, hidden_size=16, num_layers=2,
-                    dropout=0.15, zoneout=0.2, ode_unfolds=2,
+                    dropout=0.15, zoneout=0.2, ode_unfolds=1,
                     ffn_mult=1.0, wiring=wiring, norm_type=norm,
                     use_checkpoint=checkpoint,
                 ).cuda().train()

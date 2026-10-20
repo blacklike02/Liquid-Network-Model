@@ -11,8 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
+from .associative import InnovationMemory
 from .layers import (
     ChunkMemory,
+    CompactChunkMemory,
+    validate_retired_architecture,
     LiquidCell,
     LockedDropout,
     ResidualFFN,
@@ -31,16 +34,6 @@ from .layers import (
 
 def get_base_model(model):
     return getattr(model, "_orig_mod", model)
-
-
-def describe_wiring(model) -> str:
-    base = get_base_model(model)
-    if getattr(base, "wiring", "dense") != "ncp":
-        return "dense"
-    frac = base.cells[0].recurrent_param_fraction
-    if frac is None:
-        return "dense"
-    return f"ncp (рекуррентная часть ~{frac * 100:.0f}% от dense по параметрам/FLOPs)"
 
 
 def detach_hidden(hidden):
@@ -115,17 +108,22 @@ class LiquidLanguageModel(nn.Module):
         gate_mode: str = "ltc",
         ode_solver: str = "euler",
         wiring: str = "dense",
-        ncp_command_frac: float = 0.4,
-        ncp_motor_frac: float = 0.2,
         memory_slots: int = 0,
         ffn_mult: float = 0.0,
-        norm_type: str = "layer",
+        norm_type: str = "rms",
+        innovation_memory_dim: int = 0,
+        memory_dim: int = 0,
     ) -> None:
         super().__init__()
+        validate_retired_architecture(ode_unfolds, ode_solver, wiring)
+        if memory_dim < 0 or memory_slots < 0:
+            raise ValueError("memory_dim and memory_slots must be >= 0")
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
         if ffn_mult < 0:
             raise ValueError("ffn_mult must be >= 0 (0 disables the FFN blocks)")
+        if innovation_memory_dim < 0:
+            raise ValueError("innovation_memory_dim must be >= 0")
         if tie_weights and embedding_dim != hidden_size:
             raise ValueError(
                 "tie_weights=True requires embedding_dim == hidden_size "
@@ -136,7 +134,6 @@ class LiquidLanguageModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.ode_unfolds = ode_unfolds
         self.dropout_rate = dropout
         self.zoneout = zoneout
         self.tie_weights = tie_weights
@@ -146,14 +143,15 @@ class LiquidLanguageModel(nn.Module):
         self.local_conv = local_conv
         self.use_checkpoint = use_checkpoint
         self.gate_mode = gate_mode
-        self.ode_solver = ode_solver
-        self.wiring = wiring
-        self.ncp_command_frac = ncp_command_frac
-        self.ncp_motor_frac = ncp_motor_frac
         self.memory_slots = memory_slots
         self.ffn_mult = float(ffn_mult)
         self.norm_type = norm_type
-        self.chunk_memory = ChunkMemory(hidden_size, memory_slots) if memory_slots > 0 else None
+        self.innovation_memory_dim = innovation_memory_dim
+        self.memory_dim = min(memory_dim, hidden_size) if memory_dim > 0 else 0
+        self.chunk_memory = None
+        if memory_slots > 0:
+            self.chunk_memory = (CompactChunkMemory(hidden_size, memory_slots, self.memory_dim)
+                                 if self.memory_dim else ChunkMemory(hidden_size, memory_slots))
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.emb_dropout = LockedDropout(dropout)
@@ -180,15 +178,10 @@ class LiquidLanguageModel(nn.Module):
                 LiquidCell(
                     input_size=input_size,
                     hidden_size=hidden_size,
-                    ode_unfolds=ode_unfolds,
                     dropout=dropout,
                     zoneout=zoneout,
                     multi_tau=multi_tau,
                     gate_mode=gate_mode,
-                    ode_solver=ode_solver,
-                    wiring=wiring,
-                    ncp_command_frac=ncp_command_frac,
-                    ncp_motor_frac=ncp_motor_frac,
                     norm_type=norm_type,
                 )
             )
@@ -229,8 +222,37 @@ class LiquidLanguageModel(nn.Module):
             self._do_residual = tuple([False] * num_layers)
 
         self._reset_parameters()
-        self._step_fn = self._step_impl
+        # Construct after the legacy modules so a disabled feature also preserves
+        # initialization/RNG behavior and old state_dict keys exactly.
+        self.innovation_memory = (
+            InnovationMemory(hidden_size, innovation_memory_dim)
+            if innovation_memory_dim > 0 else None
+        )
+        # Store only an optional compiled override. A bound method here creates
+        # a self-cycle and delays releasing model tensors until cyclic GC runs.
+        self._step_fn = None
+        self._sequence_batching = False
         self._kernel = "torch"
+
+    def set_sequence_batching(self, enabled: bool) -> None:
+        """Opt into batching input projections/FFNs over time between layers.
+
+        This is an execution choice, not an architecture/checkpoint change.
+        Stochastic training and compiled-step execution retain the step schedule.
+        """
+        self._sequence_batching = bool(enabled)
+
+    def _can_batch_sequence(self, seq_len: int) -> bool:
+        if not self._sequence_batching or seq_len <= 1:
+            return False
+        if self._step_fn is not None and self._kernel != "triton":
+            return False
+        if self.training:
+            if any(cell.dropout.p > 0 or cell.zoneout > 0 for cell in self.cells):
+                return False
+            if self.ffns is not None and any(ffn.dropout.p > 0 for ffn in self.ffns):
+                return False
+        return True
 
     def set_kernel(self, kernel: str) -> str:
         """Select torch or experimental Triton backend for the LTC substep.
@@ -250,8 +272,8 @@ class LiquidLanguageModel(nn.Module):
                 reason = "CUDA is unavailable"
             elif not next(self.parameters()).is_cuda:
                 reason = "the model is not on CUDA"
-            elif self.gate_mode != "ltc" or self.ode_solver != "euler":
-                reason = "only --gate-mode ltc with --ode-solver euler is supported"
+            elif self.gate_mode != "ltc":
+                reason = "only --gate-mode ltc is supported"
             if reason is not None:
                 print(f"[KERNEL] triton недоступен ({reason}) — используется torch.")
                 actual = "torch"
@@ -282,10 +304,13 @@ class LiquidLanguageModel(nn.Module):
             nn.init.zeros_(self.readout[0].bias)
 
     def initial_hidden(self, batch_size: int, device: torch.device) -> list[torch.Tensor]:
-        return [
+        hidden = [
             self.h0[i].unsqueeze(0).expand(batch_size, -1).contiguous()
             for i in range(self.num_layers)
         ]
+        if self.innovation_memory is not None:
+            hidden.append(self.innovation_memory.initial_state(batch_size, device))
+        return hidden
 
     def enable_compiled_step(
         self, mode: str = "default", batch_size: int = 2, inference: bool = False,
@@ -321,19 +346,21 @@ class LiquidLanguageModel(nn.Module):
                         if inference:
                             with torch.inference_mode():
                                 fused = [cell.fused_h_weights() for cell in self.cells]
-                                compiled(x_t, xp_t, tx_t, hidden, 1.0, fused)
+                                compiled(x_t, xp_t, tx_t, hidden, 1.0, fused, self._tau_mix_weights(),
+                                         [cell.input_projection_weights() for cell in self.cells])
                         else:
                             # fused is recomputed on every iteration: the
                             # torch.cat graph must not be reused after backward.
                             fused = [cell.fused_h_weights() for cell in self.cells]
-                            out, _ = compiled(x_t, xp_t, tx_t, hidden, 1.0, fused)
-                            out.sum().backward()
+                            out, _ = compiled(x_t, xp_t, tx_t, hidden, 1.0, fused, self._tau_mix_weights(),
+                                              [cell.input_projection_weights() for cell in self.cells])
+                            self.final_norm(out).sum().backward()
                     if not inference:
                         self.zero_grad(set_to_none=True)
                     self._step_fn = compiled
                     return True, try_mode
                 except Exception as exc:
-                    self._step_fn = self._step_impl
+                    self._step_fn = None
                     last_error = f"[{try_mode}] {type(exc).__name__}: {exc}"
                     continue
             if last_error:
@@ -345,7 +372,12 @@ class LiquidLanguageModel(nn.Module):
             else:
                 self.eval()
 
-    def _step_impl(self, x_t, xp_t, tx_t, hidden, dt, fused):
+    def _tau_mix_weights(self):
+        # Parameters are constant within one forward graph. Sharing this node
+        # retains autograd while avoiding a tiny softmax for every token/substep.
+        return [F.softmax(cell.tau_mix, dim=0) if cell.multi_tau else None for cell in self.cells]
+
+    def _step_impl(self, x_t, xp_t, tx_t, hidden, dt, fused, mix_weights=None, input_projections=None):
         hidden = list(hidden)
         do_residual = self._do_residual
         use_ckpt = self.use_checkpoint and self.training
@@ -361,13 +393,19 @@ class LiquidLanguageModel(nn.Module):
                     tx=tx_t if i == 0 else None,
                     fused_w=w,
                     fused_b=b,
+                    mix_w=mix_weights[i] if mix_weights is not None else None,
+                    input_projection=input_projections[i] if input_projections is not None else None,
                     use_reentrant=False,
                 )
             else:
                 if i == 0:
-                    h_new = cell(hidden[i], x_t, dt=dt, xp=xp_t, tx=tx_t, fused_w=w, fused_b=b)
+                    h_new = cell(hidden[i], x_t, dt=dt, xp=xp_t, tx=tx_t, fused_w=w, fused_b=b,
+                                 mix_w=mix_weights[i] if mix_weights is not None else None,
+                                 input_projection=input_projections[i] if input_projections is not None else None)
                 else:
-                    h_new = cell(hidden[i], x_t, dt=dt, fused_w=w, fused_b=b)
+                    h_new = cell(hidden[i], x_t, dt=dt, fused_w=w, fused_b=b,
+                                 mix_w=mix_weights[i] if mix_weights is not None else None,
+                                 input_projection=input_projections[i] if input_projections is not None else None)
 
             hidden[i] = h_new
             if do_residual[i]:
@@ -377,7 +415,13 @@ class LiquidLanguageModel(nn.Module):
             if self.ffns is not None:
                 x_t = self.ffns[i](x_t)
 
-        return self.final_norm(x_t), hidden
+        if self.innovation_memory is not None:
+            x_t, hidden[self.num_layers] = self.innovation_memory(
+                x_t, hidden[self.num_layers], dt=dt,
+            )
+        # Final normalization has no recurrent-state dependency. Batch it after
+        # stacking time, or normalize only the final token during prompt prefill.
+        return x_t, hidden
 
     def forward(
         self,
@@ -393,9 +437,10 @@ class LiquidLanguageModel(nn.Module):
             hidden = self.initial_hidden(batch_size, tokens.device)
         else:
             hidden = list(hidden)
-            if len(hidden) > self.num_layers:
-                conv_buf = hidden[self.num_layers]
-                hidden = hidden[: self.num_layers]
+            state_count = self.num_layers + int(self.innovation_memory is not None)
+            if len(hidden) > state_count:
+                conv_buf = hidden[state_count]
+                hidden = hidden[:state_count]
         new_conv_buf = None
 
         x = self.emb_dropout(self.embedding(tokens))
@@ -404,36 +449,85 @@ class LiquidLanguageModel(nn.Module):
             if conv_buf is None:
                 conv_buf = x.new_zeros(batch_size, self._conv_left_pad, x.size(-1))
             x_ext = torch.cat([conv_buf.to(x.dtype), x], dim=1)
-            new_conv_buf = x_ext[:, -self._conv_left_pad:, :]
+            # A detached view would still own the complete chunk's storage.
+            # Clone only the small carried tail; preserve its autograd edge.
+            new_conv_buf = x_ext[:, -self._conv_left_pad:, :].clone()
             x_conv = self.local_conv_layer(x_ext.transpose(1, 2)).transpose(1, 2)
             x = x + x_conv
 
         if fused is None:
             fused = [cell.fused_h_weights() for cell in self.cells]
+        mix_weights = self._tau_mix_weights()
+        input_projections = [cell.input_projection_weights() for cell in self.cells]
 
-        cell0 = self.cells[0]
-        xp_seq, tx_seq = cell0.precompute_x(x)
-
-        outputs = []
-        # The compiled step has no triton branch — so with the triton
-        # kernel active, inference goes through eager _step_impl.
-        if self._kernel == "triton":
-            step_fn = self._step_impl
-        else:
-            step_fn = self._step_fn
-        for t in range(seq_len):
-            out_t, hidden = step_fn(
-                x[:, t, :], xp_seq[:, t, :], tx_seq[:, t, :], hidden, dt, fused
+        if self._can_batch_sequence(seq_len):
+            features, hidden = self._forward_sequence_layers(
+                x, hidden, dt, fused, mix_weights, input_projections, last_token_only,
             )
-            outputs.append(out_t)
+        else:
+            cell0 = self.cells[0]
+            xp_seq, tx_seq = cell0.precompute_x(x, input_projections[0])
+            outputs = []
+            # Compiled steps have no Triton branch.
+            step_fn = self._step_impl if self._kernel == "triton" else (self._step_fn or self._step_impl)
+            for t in range(seq_len):
+                out_t, hidden = step_fn(
+                    x[:, t, :], xp_seq[:, t, :], tx_seq[:, t, :], hidden, dt, fused, mix_weights, input_projections
+                )
+                if not last_token_only:
+                    outputs.append(out_t)
+            features = out_t.unsqueeze(1) if last_token_only else torch.stack(outputs, dim=1)
 
         # Generation needs the final prediction only. Keep all recurrent
         # updates, but avoid projecting the whole prompt into vocabulary space.
-        features = outputs[-1].unsqueeze(1) if last_token_only else torch.stack(outputs, dim=1)
-        logits = self.readout(features)
+        logits = self.readout(self.final_norm(features))
         if new_conv_buf is not None:
             hidden = list(hidden) + [new_conv_buf]
         return logits, hidden
+
+    def _forward_sequence_layers(self, x, hidden, dt, fused, mixes, projections, last_token_only):
+        """Finish each layer before batching the next layer's independent work.
+
+        Recurrent states remain sequential. Residuals/FFNs only feed the next
+        layer, so their sequence dimension can be evaluated in parallel.
+        """
+        hidden = list(hidden)
+        length = x.size(1)
+        for index, cell in enumerate(self.cells):
+            xp, tx = cell.precompute_x(x, projections[index])
+            state = hidden[index]
+            outputs = []
+            keep_sequence = index + 1 < self.num_layers or not last_token_only or self.innovation_memory is not None
+            for t in range(length):
+                if self.use_checkpoint and self.training:
+                    state = cp.checkpoint(
+                        cell, state, x[:, t], dt=dt, xp=xp[:, t], tx=tx[:, t],
+                        fused_w=fused[index][0], fused_b=fused[index][1], mix_w=mixes[index],
+                        input_projection=projections[index], use_reentrant=False,
+                    )
+                else:
+                    state = cell(
+                        state, x[:, t], dt=dt, xp=xp[:, t], tx=tx[:, t],
+                        fused_w=fused[index][0], fused_b=fused[index][1], mix_w=mixes[index],
+                        input_projection=projections[index],
+                    )
+                if keep_sequence:
+                    outputs.append(state)
+            hidden[index] = state
+            output = torch.stack(outputs, dim=1) if keep_sequence else state.unsqueeze(1)
+            if self._do_residual[index]:
+                output = output + (x if keep_sequence else x[:, -1:])
+            if self.ffns is not None:
+                output = self.ffns[index](output)
+            x = output
+        if self.innovation_memory is not None:
+            outputs = []
+            for t in range(length):
+                output, hidden[self.num_layers] = self.innovation_memory(x[:, t], hidden[self.num_layers], dt=dt)
+                if not last_token_only:
+                    outputs.append(output)
+            x = output.unsqueeze(1) if last_token_only else torch.stack(outputs, dim=1)
+        return x, hidden
 
     def _forward_with_chunk_memory(self, tokens, hidden, memory, fused, chunk_size):
         """Process a prompt in chunks, consulting and updating ChunkMemory."""
@@ -573,22 +667,20 @@ class LiquidLanguageModel(nn.Module):
 
 
 ARCH_KEYS = (
-    "embedding_dim", "hidden_size", "num_layers", "ode_unfolds",
+    "embedding_dim", "hidden_size", "num_layers",
     "dropout", "zoneout", "tie_weights", "mlp_head", "residual",
-    "multi_tau", "local_conv", "gate_mode", "ode_solver",
-    "wiring", "ncp_command_frac", "ncp_motor_frac", "memory_slots",
-    "ffn_mult", "norm_type",
+    "multi_tau", "local_conv", "gate_mode",
+    "memory_slots", "memory_dim",
+    "ffn_mult", "norm_type", "innovation_memory_dim",
 )
 
 
 LEGACY_ARCH_DEFAULTS = {
     "zoneout": 0.0, "tie_weights": False, "mlp_head": False,
     "residual": False, "multi_tau": False, "local_conv": False,
-    "gate_mode": "ltc", "ode_solver": "euler",
-    "wiring": "dense",
-    "ncp_command_frac": 0.4, "ncp_motor_frac": 0.2,
-    "memory_slots": 0,
-    "ffn_mult": 0.0, "norm_type": "layer",
+    "gate_mode": "ltc",
+    "memory_slots": 0, "memory_dim": 0,
+    "ffn_mult": 0.0, "norm_type": "layer", "innovation_memory_dim": 0,
 }
 
 
@@ -598,13 +690,27 @@ def _arch_value(config, key):
     return LEGACY_ARCH_DEFAULTS.get(key)
 
 
+def validate_retired_config(config):
+    validate_retired_architecture(config.get("ode_unfolds", 1),
+                                  config.get("ode_solver", "euler"),
+                                  config.get("wiring", "dense"))
+    # Missing metadata historically meant LayerNorm, never RMSNorm.
+    if config.get("norm_type") != "rms":
+        raise ValueError(
+            "Checkpoint normalization is not explicitly RMSNorm (norm_type='rms'). "
+            "LayerNorm checkpoints, including older checkpoints without norm_type, "
+            "are retired. Load them with an earlier revision or train a new RMSNorm model; "
+            "changing the metadata does not convert trained weights."
+        )
+
+
 def create_model_from_config(vocab_size, config, device):
+    validate_retired_config(config)
     return LiquidLanguageModel(
         vocab_size=vocab_size,
         embedding_dim=int(config["embedding_dim"]),
         hidden_size=int(config["hidden_size"]),
         num_layers=int(config["num_layers"]),
-        ode_unfolds=int(config["ode_unfolds"]),
         dropout=float(config.get("dropout", 0.05)),
         zoneout=float(_arch_value(config, "zoneout") or 0.0),
         tie_weights=bool(_arch_value(config, "tie_weights")),
@@ -614,17 +720,20 @@ def create_model_from_config(vocab_size, config, device):
         local_conv=bool(_arch_value(config, "local_conv")),
         use_checkpoint=False,
         gate_mode=str(_arch_value(config, "gate_mode") or "ltc"),
-        ode_solver=str(_arch_value(config, "ode_solver") or "euler"),
-        wiring=str(_arch_value(config, "wiring") or "dense"),
-        ncp_command_frac=float(_arch_value(config, "ncp_command_frac") or 0.4),
-        ncp_motor_frac=float(_arch_value(config, "ncp_motor_frac") or 0.2),
         memory_slots=int(_arch_value(config, "memory_slots") or 0),
+        memory_dim=int(_arch_value(config, "memory_dim") or 0),
         ffn_mult=float(_arch_value(config, "ffn_mult") or 0.0),
-        norm_type=str(_arch_value(config, "norm_type") or "layer"),
+        norm_type="rms",
+        innovation_memory_dim=int(_arch_value(config, "innovation_memory_dim") or 0),
     ).to(device)
 
 
 def load_model_state_compat(model, state):
+    if isinstance(get_base_model(model), LiquidLanguageModel) and any(
+        key.endswith("norm.bias") for key in state
+    ):
+        raise RuntimeError("LayerNorm state cannot be loaded into an RMSNorm model. "
+                           "Use an earlier revision for LayerNorm checkpoints.")
     try:
         model.load_state_dict(state, strict=True)
         return
@@ -669,7 +778,8 @@ def save_checkpoint(
         "best_val": best_val,
         "tokenizer": tokenizer.to_config(),
         "corpus_sha256": corpus_sha256,
-        "config": vars(args),
+        "config": {**vars(args), "norm_type": base_model.norm_type}
+                  if isinstance(base_model, LiquidLanguageModel) else dict(vars(args)),
     }
     # Replace only after a complete write, so an interrupted/failed save keeps
     # the previous checkpoint intact. Use the same directory/filesystem.
@@ -712,6 +822,14 @@ def load_checkpoint_raw(path, device):
             ) from exc
         print("[CHECKPOINT] WARNING: unsafe loading (--trust-checkpoint).")
         return torch.load(path, map_location=device, weights_only=False)
+
+
+def load_inference_checkpoint(path):
+    """Load on CPU and discard training-only tensors before building a model."""
+    payload = load_checkpoint_raw(path, torch.device("cpu"))
+    for key in ("optimizer_state", "scheduler_state", "scaler_state", "ema_state"):
+        payload.pop(key, None)
+    return payload
 
 
 def print_checkpoint_info(checkpoint):

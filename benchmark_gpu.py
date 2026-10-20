@@ -69,11 +69,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true",
                         help="Compile the CUDA recurrent step; CPU remains eager; incompatible with Triton")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--innovation-memory-dim", type=int, default=0,
+                        help="Optional associative side-memory width; 0 keeps the baseline")
     args = parser.parse_args()
     args.repeats = args.repeats if args.repeats is not None else (2 if args.quick else 5)
     args.warmup = args.warmup if args.warmup is not None else (1 if args.quick else 2)
     if args.threads < 1 or args.repeats < 1 or args.warmup < 0:
         parser.error("threads/repeats must be positive and warmup nonnegative")
+    if args.innovation_memory_dim < 0:
+        parser.error("innovation-memory-dim must be nonnegative")
     if args.compile and args.kernel == "triton":
         parser.error("--compile is incompatible with --kernel triton")
     if args.compile and args.device == "cpu":
@@ -98,8 +102,7 @@ def model_config(workload: dict) -> dict:
         "tie_weights": True, "mlp_head": False, "residual": True,
         "multi_tau": True, "local_conv": True, "use_checkpoint": False,
         "gate_mode": "ltc", "ode_solver": "euler", "wiring": "dense",
-        "ncp_command_frac": 0.4, "ncp_motor_frac": 0.2,
-        "memory_slots": 0, "ffn_mult": 0.0, "norm_type": "layer",
+        "memory_slots": 0, "ffn_mult": 0.0, "norm_type": "rms",
     }
 
 
@@ -386,6 +389,7 @@ def main() -> int:
                 case = {"name": name, "device": device_name, "precision": precision,
                         "workload": dict(WORKLOADS[name]), "model_config": model_config(WORKLOADS[name]),
                         "status": "running"}
+                case["model_config"]["innovation_memory_dim"] = args.innovation_memory_dim
                 result["cases"].append(case)
                 print(f"[START] {name} {device_name} {precision} kernel="
                       f"{args.kernel if device_name == 'cuda' else 'torch'}", flush=True)

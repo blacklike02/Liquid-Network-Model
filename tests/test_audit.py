@@ -117,10 +117,10 @@ class GenerationPrefillTests(unittest.TestCase):
     def test_last_token_projection_matches_full_output_and_hidden(self):
         torch.manual_seed(23)
         for gate, wiring, norm, mlp in (
-            ("ltc", "dense", "layer", False),
-            ("ltc", "ncp", "rms", True),
+            ("ltc", "dense", "rms", False),
+            ("ltc", "dense", "rms", True),
             ("cfc", "dense", "rms", True),
-            ("cfc", "ncp", "layer", False),
+            ("cfc", "dense", "rms", False),
         ):
             with self.subTest(gate=gate, wiring=wiring, norm=norm, mlp=mlp):
                 model = LiquidLanguageModel(

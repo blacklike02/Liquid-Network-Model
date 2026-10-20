@@ -60,9 +60,9 @@ class CudaRegressionTests(unittest.TestCase):
     def model_options(**changes):
         options = dict(
             vocab_size=23, embedding_dim=16, hidden_size=16, num_layers=2,
-            ode_unfolds=2, dropout=0.0, zoneout=0.0, tie_weights=True,
+            ode_unfolds=1, dropout=0.0, zoneout=0.0, tie_weights=True,
             residual=True, local_conv=True, multi_tau=True,
-            ffn_mult=1.0, norm_type="layer",
+            ffn_mult=1.0, norm_type="rms",
         )
         options.update(changes)
         return options
@@ -139,10 +139,10 @@ class CudaRegressionTests(unittest.TestCase):
         targets = torch.randint(0, 23, tokens.shape)
         cases = (
             dict(gate_mode="ltc", wiring="dense", multi_tau=False),
-            dict(gate_mode="ltc", wiring="dense", ode_solver="heun"),
-            dict(gate_mode="ltc", wiring="ncp", norm_type="rms", mlp_head=True),
+            dict(gate_mode="ltc", wiring="dense", memory_slots=2, memory_dim=8),
+            dict(gate_mode="ltc", wiring="dense", norm_type="rms", mlp_head=True),
             dict(gate_mode="cfc", wiring="dense", norm_type="rms"),
-            dict(gate_mode="cfc", wiring="ncp", mlp_head=True),
+            dict(gate_mode="cfc", wiring="dense", mlp_head=True),
         )
         for options in cases:
             with self.subTest(**options):
@@ -165,10 +165,10 @@ class CudaRegressionTests(unittest.TestCase):
     def test_cuda_tokenwise_carry_matches_full_sequence(self):
         tokens = torch.randint(0, 23, (2, 9), device=self.device)
         for gate in ("ltc", "cfc"):
-            for wiring in ("dense", "ncp"):
-                with self.subTest(gate=gate, wiring=wiring):
+            for multi_tau in (False, True):
+                with self.subTest(gate=gate, multi_tau=multi_tau):
                     model = LiquidLanguageModel(**self.model_options(
-                        gate_mode=gate, wiring=wiring,
+                        gate_mode=gate, multi_tau=multi_tau,
                     )).to(self.device).eval()
                     with torch.inference_mode():
                         expected, expected_hidden = model(tokens)
@@ -185,10 +185,10 @@ class CudaRegressionTests(unittest.TestCase):
         tokens = torch.randint(0, 23, (2, 5), device=self.device)
         targets = torch.randint(0, 23, tokens.shape, device=self.device)
         for gate in ("ltc", "cfc"):
-            for wiring in ("dense", "ncp"):
-                with self.subTest(gate=gate, wiring=wiring):
+            for multi_tau in (False, True):
+                with self.subTest(gate=gate, multi_tau=multi_tau):
                     reference = LiquidLanguageModel(**self.model_options(
-                        gate_mode=gate, wiring=wiring, norm_type="rms",
+                        gate_mode=gate, multi_tau=multi_tau,
                     )).to(self.device).train()
                     checkpointed = copy.deepcopy(reference)
                     checkpointed.use_checkpoint = True
@@ -207,7 +207,7 @@ class CudaRegressionTests(unittest.TestCase):
                 for gate in ("ltc", "cfc"):
                     with self.subTest(dtype=dtype, optimizer=optimizer_name, gate=gate):
                         model = LiquidLanguageModel(**self.model_options(
-                            gate_mode=gate, wiring="ncp", norm_type="rms",
+                            gate_mode=gate, wiring="dense", norm_type="rms",
                         )).to(self.device).train()
                         optimizer = make_optimizer(model, self.optimizer_options(optimizer_name), self.device)
                         scaler = self.make_scaler() if dtype == torch.float16 else None
@@ -322,7 +322,7 @@ class CudaRegressionTests(unittest.TestCase):
         self.assertEqual(tokenizer.vocab_size, 23)
         for optimizer_name in ("adamw", "muon"):
             with self.subTest(optimizer=optimizer_name), tempfile.TemporaryDirectory() as directory:
-                options = self.model_options(gate_mode="cfc", wiring="ncp", norm_type="rms", memory_slots=2)
+                options = self.model_options(gate_mode="cfc", wiring="dense", norm_type="rms", memory_slots=2)
                 model = LiquidLanguageModel(**options).to(self.device).train()
                 optimizer_args = self.optimizer_options(optimizer_name)
                 optimizer = make_optimizer(model, optimizer_args, self.device)

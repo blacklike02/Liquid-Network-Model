@@ -14,7 +14,10 @@ try:
 except ImportError:
     _HAS_TOKENIZERS = False
 
-from .data import DIALOGUE_SPECIAL_TOKENS, EXAMPLE_END_TAG, FIM_SPECIAL_TOKENS
+from .data import DIALOGUE_SPECIAL_TOKENS, EXAMPLE_END_TAG
+
+# Reserved historical IDs; this is not an active data transformation.
+_LEGACY_RESERVED_TOKENS = ["<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>"]
 
 
 class CharTokenizer:
@@ -89,7 +92,7 @@ class BPETokenizer:
             show_progress=False,
         )
         chunk_size = 10_000
-        chunks = [corpus[i:i + chunk_size] for i in range(0, len(corpus), chunk_size)] or [corpus]
+        chunks = (corpus[i:i + chunk_size] for i in range(0, len(corpus), chunk_size))
         tok.train_from_iterator(chunks, trainer=trainer)
         return cls(tok)
 
@@ -138,7 +141,7 @@ def build_tokenizer(corpus: str, kind: str, vocab_size: int):
             vocab_size = cap
         return BPETokenizer.train(
             corpus, vocab_size=vocab_size,
-            special_tokens=DIALOGUE_SPECIAL_TOKENS + FIM_SPECIAL_TOKENS,
+            special_tokens=DIALOGUE_SPECIAL_TOKENS + _LEGACY_RESERVED_TOKENS,
         )
     raise ValueError(f"Неизвестный тип токенизатора: {kind}")
 
@@ -165,6 +168,19 @@ def encode_corpus(tokenizer, text: str) -> np.ndarray:
     if method is not None:
         return method(text)
     return np.asarray(tokenizer.encode(text), dtype=np.int64)
+
+
+def encode_corpus_split(tokenizer, text: str, val_split: float, policy: str):
+    """Keep new BPE fitting/encoding boundaries aligned; retain legacy resumes."""
+    if policy == "legacy_tokens":
+        encoded = encode_corpus(tokenizer, text)
+        return encoded, int(len(encoded) * (1.0 - val_split))
+    if policy != "characters_v1":
+        raise ValueError(f"Unknown data split policy: {policy}")
+    boundary = int(len(text) * (1.0 - val_split))
+    train = encode_corpus(tokenizer, text[:boundary])
+    validation = encode_corpus(tokenizer, text[boundary:])
+    return np.concatenate((train, validation)), len(train)
 
 
 def default_stop_ids(tokenizer) -> list[int]:

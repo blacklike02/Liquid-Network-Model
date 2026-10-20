@@ -30,8 +30,7 @@ from .utils import choose_device, print_device_info, set_seed
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Liquid RNN language model (v3.7: gate_mode ltc/cfc, ode_solver euler/heun, "
-            "SwiGLU FFN + RMSNorm, top-k KD, long-context stage, FIM)"
+            "Liquid RNN language model: LTC/CfC, native RMSNorm and compact chunk memory"
         )
     )
 
@@ -60,16 +59,6 @@ def build_parser():
                         help="Insert '===== filename =====' lines between files "
                              "(legacy behavior). Off by default. With --resume, use the "
                              "checkpoint value (legacy: on).")
-    parser.add_argument("--fim-rate", type=float, default=0.0,
-                        help="Fill-in-the-middle for CODE files (.py .js .ts .java .cpp ...). "
-                             "0 (default) = off. With p > 0, code files are also read from "
-                             "--data, split into ~3000-char chunks on line boundaries, and each "
-                             "chunk is rewritten with probability p as "
-                             "<|fim_prefix|>P<|fim_suffix|>S<|fim_middle|>M<|end|>. "
-                             "Typical value: 0.5. Requires --tokenizer bpe (new tokenizers get "
-                             "the <|fim_*|> special tokens; old checkpoints do not have them, "
-                             "FIM is then disabled). The rearrangement is deterministic. "
-                             "With --resume the value is taken from the checkpoint.")
     parser.add_argument("--trust-checkpoint", action="store_true",
                         help="Allow unsafe checkpoint loading (weights_only=False), "
                              "if safe loading fails. Only for your own files.")
@@ -79,7 +68,7 @@ def build_parser():
     parser.add_argument("--eval-batches", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--state-carry", type=int, default=2)
+    parser.add_argument("--state-carry", type=int, default=4)
     parser.add_argument("--long-epochs", type=int, default=0,
                         help="Extra epochs of a final long-context stage after --epochs "
                              "(0 = off). The same weights are trained with --long-state-carry "
@@ -99,7 +88,6 @@ def build_parser():
     parser.add_argument("--embedding-dim", type=int, default=384)
     parser.add_argument("--hidden-size", type=int, default=384)
     parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument("--ode-unfolds", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--zoneout", type=float, default=0.1)
     parser.add_argument("--tie-weights", action=argparse.BooleanOptionalAction, default=True)
@@ -119,36 +107,18 @@ def build_parser():
                              "candidates ff1/ff2 and trainable sigmoid interpolation over "
                              "time instead of explicit ODE integration. With cfc, the "
                              "--multi-tau is ignored (this gate has no tau).")
-    parser.add_argument("--ode-solver", type=str, choices=["euler", "heun"], default="euler",
-                        help="Substep integration method (--ode-unfolds) in the ltc gate "
-                             "(does not affect --gate-mode cfc). euler — candidate/tau "
-                             "are evaluated once at the start of the substep, then the ODE is solved "
-                             "exactly with 'frozen' candidate/tau. heun — "
-                             "predictor-corrector (RK2): the substep is computed twice, "
-                             "candidate/tau are averaged — second-order accuracy at the cost of "
-                             "2x computations per substep.")
-    parser.add_argument("--wiring", type=str, choices=["dense", "ncp"], default="dense",
-                        help="dense (by default) — standard fully connected recurrent "
-                             "matrix. ncp — the recurrent matrix is replaced by a SET of "
-                             "physically SMALLER matrices using the Neural Circuit "
-                             "Policies (Lechner et al. 2020): neurons are divided into "
-                             "inter/command/motor, allowed paths are inter->inter, "
-                             "inter->command, command->command, command->motor, and "
-                             "feedback motor->command — a real reduction in both "
-                             "parameters and recurrent-part FLOPs. Does NOT include "
-                             "the biophysical synapse polarity from the original paper "
-                             "(see the NCPRecurrent docstring).")
-    parser.add_argument("--ncp-command-frac", type=float, default=0.4,
-                        help="Fraction of hidden_size allocated to command neurons in --wiring ncp.")
-    parser.add_argument("--ncp-motor-frac", type=float, default=0.2,
-                        help="Fraction of hidden_size allocated to motor neurons in --wiring ncp "
-                             "(the remainder goes to inter neurons).")
-    parser.add_argument("--memory-slots", type=int, default=0,
-                        help="0 (by default) — disabled. >0 — enables ChunkMemory: "
-                             "a sliding FIFO buffer of summaries from previous --state-carry subchunks "
-                             "(in the style of Transformer-XL memory / the M-CfC idea), read/written "
-                             "around each subchunk in run_training/evaluate and every --seq-len tokens "
-                             "in generate()/chat. Requires --state-carry >= 2 for effective training.")
+    parser.add_argument("--memory-slots", type=int, default=3,
+                        help="FIFO history slots (default: 3; 0 disables chunk memory). "
+                             "Training uses --state-carry chunks; only written slots are read.")
+    parser.add_argument("--memory-dim", type=int, default=64,
+                        help="Compact memory projection width (default: 64, capped at hidden size). "
+                             "0 restores the legacy full-width memory for old checkpoints.")
+    parser.add_argument("--innovation-memory-dim", type=int, default=0,
+                        help="Experimental associative side memory: 0 disables it; e.g. 32 uses "
+                             "a 32x32 FP32 recurrent matrix. Reads old associations and writes "
+                             "prediction-error corrections with learned continuous decay. "
+                             "Adds per-token work; no attention softmax or token cache. "
+                             "Stored in checkpoints; old models load with it disabled.")
     parser.add_argument("--ffn-mult", type=float, default=0.0,
                         help="0 (default) = off. >0 adds a pre-norm SwiGLU channel-mixing block "
                              "(with its own residual) after every liquid layer, with inner width "
@@ -156,19 +126,22 @@ def build_parser():
                              "per-token recurrent step, so it adds parameters and per-step cost "
                              "(measure the speed on your GPU before long runs). "
                              "Stored in the checkpoint; old checkpoints are loaded with it off.")
-    parser.add_argument("--norm-type", type=str, choices=["layer", "rms"], default="layer",
-                        help="Normalization in the cells, FFN blocks and before the readout. "
-                             "layer (default) = LayerNorm, rms = RMSNorm (no mean/bias). "
-                             "Stored in the checkpoint.")
+    # Fixed architecture metadata, persisted in checkpoints; no CLI selector.
+    parser.set_defaults(norm_type="rms")
     parser.add_argument("--kernel", type=str, choices=["torch", "triton"], default="torch",
                         help="Backend for LTC substep activations and tail. torch (default) uses standard "
                              "PyTorch operations; triton uses fused CUDA forward/backward "
                              "kernels (first-order gradients). Requires CUDA + Triton and "
-                             "supports only --gate-mode ltc --ode-solver euler. Uses eager "
+                             "supports only --gate-mode ltc. Uses eager "
                              "recurrent steps instead of torch.compile. Run --selftest-triton "
                              "and benchmark full-model training before long runs.")
     parser.add_argument("--selftest-triton", action="store_true",
                         help="Compare the triton kernel with the torch path, benchmark it, then exit.")
+    parser.add_argument("--sequence-batching", action=argparse.BooleanOptionalAction, default=False,
+                        help="Batch independent sequence projections/FFNs between recurrent layers. "
+                             "Opt-in execution mode; recurrence stays sequential. Stochastic training "
+                             "and compiled steps retain the original schedule. AMP gradient rounding "
+                             "can differ from per-token projections. Benchmark on your configuration.")
     parser.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=False,
                         help="Gradient checkpointing on every LiquidCell call. "
                              "WARNING: granularity 'one cell call per "
@@ -259,8 +232,12 @@ def validate_training_ranges(args) -> None:
         raise ValueError("--dialogue-anchor-ratio must be between 0 and 1")
     if not math.isfinite(args.min_lr_ratio) or not 0.0 <= args.min_lr_ratio <= 1.0:
         raise ValueError("--min-lr-ratio must be between 0 and 1")
+    if getattr(args, "memory_dim", 0) < 0:
+        raise ValueError("--memory-dim must be >= 0")
     if args.memory_slots < 0:
         raise ValueError("--memory-slots must be >= 0")
+    if getattr(args, "innovation_memory_dim", 0) < 0:
+        raise ValueError("--innovation-memory-dim must be >= 0")
     if args.grad_clip < 0.0:
         raise ValueError("--grad-clip must be >= 0")
     if args.optimizer == "muon" and args.muon_ns_steps < 1:
@@ -355,7 +332,7 @@ def main():
         return
 
     if args.info:
-        checkpoint = load_checkpoint_raw(Path(args.checkpoint), device)
+        checkpoint = load_checkpoint_raw(Path(args.checkpoint), torch.device("cpu"))
         print_checkpoint_info(checkpoint)
         return
 
@@ -389,8 +366,6 @@ def main():
     if args.kd_topk < 0:
         raise ValueError("--kd-topk must be >= 0")
     validate_training_ranges(args)
-    if not 0.0 <= args.fim_rate <= 1.0:
-        raise ValueError("--fim-rate must be between 0 and 1")
     if args.epochs < 1:
         raise ValueError("--epochs must be >= 1")
     if args.steps_per_epoch < 1:

@@ -185,8 +185,7 @@ def main():
         parser.error("this experiment does not implement ChunkMemory")
     corpus = load_texts(args.data, min_chars=1000,
                         shuffle_files=cfg.get("shuffle_files", False),
-                        file_headers=cfg.get("file_headers", True),
-                        fim_rate=cfg.get("fim_rate", 0.))
+                        file_headers=cfg.get("file_headers", True))
     corpus_hash = hashlib.sha256(corpus.encode("utf-8")).hexdigest()
     if corpus_hash != source.get("corpus_sha256"):
         parser.error("corpus fingerprint differs from the source checkpoint")

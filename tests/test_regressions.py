@@ -103,15 +103,14 @@ class EvaluationRegressionTests(unittest.TestCase):
 class ResumeConfigurationRegressionTests(unittest.TestCase):
     def test_resume_restores_validation_split_from_checkpoint(self):
         args = SimpleNamespace(
-            shuffle_files=True, file_headers=False, fim_rate=0.0, val_split=0.1,
+            shuffle_files=True, file_headers=False, val_split=0.1,
         )
         restore_resume_data_settings(
             args,
-            {"shuffle_files": False, "file_headers": True, "fim_rate": 0.5, "val_split": 0.2},
+            {"shuffle_files": False, "file_headers": True, "val_split": 0.2},
         )
         self.assertFalse(args.shuffle_files)
         self.assertTrue(args.file_headers)
-        self.assertEqual(args.fim_rate, 0.5)
         self.assertEqual(args.val_split, 0.2)
 
 
@@ -312,13 +311,13 @@ class TokenWeightedGradientNormalizationTests(unittest.TestCase):
 
 class RecurrentModelRegressionTests(unittest.TestCase):
     @staticmethod
-    def make_model(gate_mode, local_conv, wiring="dense"):
+    def make_model(gate_mode, local_conv, norm_type="rms"):
         return LiquidLanguageModel(
             vocab_size=23,
             embedding_dim=12,
             hidden_size=12,
             num_layers=2,
-            ode_unfolds=2,
+            ode_unfolds=1,
             dropout=0.0,
             zoneout=0.0,
             tie_weights=True,
@@ -326,9 +325,7 @@ class RecurrentModelRegressionTests(unittest.TestCase):
             multi_tau=True,
             local_conv=local_conv,
             gate_mode=gate_mode,
-            wiring=wiring,
-            ncp_command_frac=0.4,
-            ncp_motor_frac=0.2,
+            norm_type=norm_type,
         ).eval()
 
     def test_tokenwise_forward_matches_full_sequence_forward(self):
@@ -351,14 +348,14 @@ class RecurrentModelRegressionTests(unittest.TestCase):
                         streamed_logits, full_logits, rtol=1e-4, atol=1e-5
                     )
 
-    def test_dense_and_ncp_cells_backpropagate_finite_gradients(self):
+    def test_dense_cells_backpropagate_finite_gradients(self):
         torch.manual_seed(11)
         tokens = torch.randint(0, 23, (2, 6), dtype=torch.long)
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
         for gate_mode in ("ltc", "cfc"):
-            for wiring in ("dense", "ncp"):
-                with self.subTest(gate_mode=gate_mode, wiring=wiring):
-                    model = self.make_model(gate_mode, False, wiring=wiring)
+            for local_conv in (False, True):
+                with self.subTest(gate_mode=gate_mode, local_conv=local_conv):
+                    model = self.make_model(gate_mode, local_conv)
                     model.train()
                     logits, _ = model(inputs)
                     loss = F.cross_entropy(logits.reshape(-1, 23), targets.reshape(-1))
@@ -367,8 +364,6 @@ class RecurrentModelRegressionTests(unittest.TestCase):
                     grads = [p.grad for p in model.parameters() if p.grad is not None]
                     self.assertTrue(grads)
                     self.assertTrue(all(torch.isfinite(g).all().item() for g in grads))
-                    if wiring == "ncp":
-                        self.assertLess(model.cells[0].recurrent_param_fraction, 1.0)
 
 
 class TritonLtcAutogradRegressionTests(unittest.TestCase):

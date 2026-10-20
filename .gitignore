@@ -3,6 +3,17 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local compiler caches
+.triton/
+.torchinductor/
+torch_compile_debug/
 
 # Training: checkpoints, logs and data
 *.pt
@@ -12,6 +23,10 @@ wandb/
 data/
 data_shakespeare/
 tokenizer*.json
+
+# CLI outputs written to the working directory
+/generated.txt
+/training_info.json
 
 # Local patch backups
 .liquid_triton_v2_backup_*/

@@ -6,6 +6,9 @@ import hashlib
 import json
 import math
 import time
+import gc
+from contextlib import ExitStack
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -15,9 +18,6 @@ import torch.nn.functional as F
 from .data import (
     BOT_TAG,
     EXAMPLE_END_TAG,
-    FIM_MIDDLE_TAG,
-    FIM_PREFIX_TAG,
-    FIM_SUFFIX_TAG,
     SYSTEM_TAG,
     USER_TAG,
     load_texts,
@@ -29,10 +29,11 @@ from .model import (
     _arch_value,
     clone_float_state,
     create_model_from_config,
-    describe_wiring,
+    validate_retired_config,
     detach_hidden,
     get_base_model,
     load_checkpoint_raw,
+    load_inference_checkpoint,
     load_model_state_compat,
     print_checkpoint_info,
     restore_float_state,
@@ -43,7 +44,7 @@ from .tokenizer import (
     _HAS_TOKENIZERS,
     build_tokenizer,
     default_stop_ids,
-    encode_corpus,
+    encode_corpus_split,
     tokenizer_from_checkpoint,
 )
 from .utils import TrainLogger, cuda_memory_report
@@ -54,7 +55,10 @@ from .utils import TrainLogger, cuda_memory_report
 # ---------------------------------------------------------------------------
 
 
-_ARANGE_CACHE: dict[tuple[str, int], torch.Tensor] = {}
+@lru_cache(maxsize=8)
+def _batch_offsets(device, seq_len):
+    """Bound device-buffer retention when a process uses many span lengths."""
+    return torch.arange(seq_len + 1, device=device)
 
 
 IGNORE_INDEX = -100
@@ -64,7 +68,9 @@ def restore_resume_data_settings(args, saved_cfg: dict) -> None:
     """Restore settings that define corpus order and the train/validation split."""
     args.shuffle_files = bool(saved_cfg.get("shuffle_files", False))
     args.file_headers = bool(saved_cfg.get("file_headers", True))
-    args.fim_rate = float(saved_cfg.get("fim_rate", 0.0) or 0.0)
+    if saved_cfg.get("fim_rate", 0.0):
+        raise ValueError("Cannot resume a retired FIM corpus recipe; use the earlier revision.")
+    args.data_split_policy = saved_cfg.get("data_split_policy", "legacy_tokens")
 
     if "val_split" in saved_cfg:
         saved_val_split = float(saved_cfg["val_split"])
@@ -100,11 +106,7 @@ def get_batch(
     max_start = split_end - seq_len - 1
     if max_start < split_start:
         raise ValueError("Not enough text for the selected seq_len and train/val split.")
-    key = (str(data.device), seq_len)
-    ar = _ARANGE_CACHE.get(key)
-    if ar is None or ar.device != data.device:
-        ar = torch.arange(seq_len + 1, device=data.device)
-        _ARANGE_CACHE[key] = ar
+    ar = _batch_offsets(data.device, seq_len)
     randint_kwargs = {"generator": gen} if gen is not None else {}
     if anchors is not None and len(anchors) > 0 and anchor_ratio > 0.0:
         n_anchor = int(round(batch_size * min(1.0, anchor_ratio)))
@@ -339,11 +341,12 @@ class EMA:
         }
 
     @classmethod
-    def from_state(cls, state, decay):
+    def from_state(cls, state, decay, device=None):
         obj = cls.__new__(cls)
         obj.decay = float(decay)
         obj.updates = int(state.get("updates", 0))
-        obj.shadow = state["shadow"]
+        obj.shadow = {k: v.to(device=device) if device is not None else v
+                      for k, v in state["shadow"].items()}
         return obj
 
     def state_dict(self):
@@ -408,6 +411,7 @@ def evaluate(
                 if memory is not None:
                     memory = memory.detach()
             hidden = detach_hidden(hidden)
+            del logits, _loss, sum_loss, valid_count
     if token_sum.item() == 0:
         raise ValueError(
             "Validation produced zero unmasked target tokens. Increase --eval-batches "
@@ -422,6 +426,12 @@ def evaluate(
 
 
 def run_training(args, device):
+    # Always stop logger workers, including after failed forward/backward/save.
+    with ExitStack() as resources:
+        return _run_training(args, device, resources)
+
+
+def _run_training(args, device, resources):
     data_dir = Path(args.data)
     checkpoint_path = Path(args.checkpoint)
     last_checkpoint_path = Path(args.last_checkpoint)
@@ -434,8 +444,9 @@ def run_training(args, device):
 
     resume_tokenizer = None
     if args.resume:
-        resume_payload = load_checkpoint_raw(last_checkpoint_path, device)
+        resume_payload = load_checkpoint_raw(last_checkpoint_path, torch.device("cpu"))
         saved_cfg = resume_payload["config"]
+        validate_retired_config(saved_cfg)
         restore_resume_data_settings(args, saved_cfg)
         resume_tokenizer = tokenizer_from_checkpoint(resume_payload)
 
@@ -443,29 +454,9 @@ def run_training(args, device):
     if not 0.01 <= val_split <= 0.5:
         raise ValueError("--val-split must be between 0.01 and 0.5")
 
-    fim_rate = float(args.fim_rate)
-    if not 0.0 <= fim_rate <= 1.0:
-        raise ValueError("--fim-rate must be between 0 and 1")
-    if fim_rate > 0.0:
-        if resume_tokenizer is not None:
-            fim_supported = all(
-                resume_tokenizer.token_to_id(tag) is not None
-                for tag in (FIM_PREFIX_TAG, FIM_SUFFIX_TAG, FIM_MIDDLE_TAG)
-            )
-        else:
-            fim_supported = args.tokenizer == "bpe" and _HAS_TOKENIZERS
-        if not fim_supported:
-            print(
-                "[DATA] FIM отключён: нужен BPE-токенизатор со специальными токенами "
-                "<|fim_*|> (для char-токенизатора и старых чекпоинтов их нет)."
-            )
-            fim_rate = 0.0
-    args.fim_rate = fim_rate
-
     corpus = load_texts(
         data_dir, min_chars=args.min_chars, max_file_mb=args.max_file_mb,
         shuffle_files=args.shuffle_files, file_headers=args.file_headers,
-        fim_rate=fim_rate,
     )
     corpus_sha = hashlib.sha256(corpus.encode("utf-8", errors="ignore")).hexdigest()
 
@@ -492,14 +483,19 @@ def run_training(args, device):
             kind = "char"
         tok_corpus = corpus if kind == "char" else corpus[: int(len(corpus) * (1.0 - val_split))]
         tokenizer = build_tokenizer(tok_corpus, kind, args.vocab_size)
+        args.data_split_policy = "characters_v1" if kind == "bpe" else "legacy_tokens"
+        del tok_corpus
 
     vocab_size = tokenizer.vocab_size
     print(f"[DATA] Tokenizer: {tokenizer.kind} | vocab: {vocab_size}")
 
-    encoded = encode_corpus(tokenizer, corpus)
+    encoded, split = encode_corpus_split(
+        tokenizer, corpus, val_split, args.data_split_policy,
+    )
     print(f"[DATA] Corpus tokens: {len(encoded):,}")
-
-    split = int(len(encoded) * (1.0 - val_split))
+    print(f"[DATA] Split: {args.data_split_policy} | train: {split:,} | validation: {len(encoded) - split:,}")
+    corpus_chars, corpus_tokens = len(corpus), len(encoded)
+    del corpus
     state_carry = max(1, int(args.state_carry))
     long_epochs = max(0, int(args.long_epochs))
     long_state_carry = max(1, int(args.long_state_carry)) if long_epochs > 0 else state_carry
@@ -509,8 +505,8 @@ def run_training(args, device):
         print("[STAGE] WARNING: --long-state-carry is not larger than --state-carry; "
               "the final stage will not use a longer context.")
     if args.memory_slots > 0 and max_state_carry < 2:
-        print("[MODEL] WARNING: --memory-slots has no effect with --state-carry 1 "
-              "(memory is read only from the second subchunk).")
+        print("[MODEL] WARNING: --state-carry 1 provides no historical chunks; "
+              "memory cannot learn retrieval from previous chunks.")
     span_len = args.seq_len * state_carry
     max_span_len = args.seq_len * max_state_carry
     if split <= max_span_len + 2:
@@ -534,6 +530,7 @@ def run_training(args, device):
             print(f"[DATA] Loss mask: {masked_frac * 100:.1f}% of tokens excluded from loss.")
         else:
             print("[DATA] No dialogue tags found in corpus — loss mask is unnecessary.")
+        del train_mask_np
 
     dialogue_anchors = None
     val_dialogue_anchors = None
@@ -551,13 +548,15 @@ def run_training(args, device):
             val_dialogue_anchors = torch.from_numpy(val_anchors_np)
             if device.type == "cuda":
                 val_dialogue_anchors = val_dialogue_anchors.to(device)
+        del anchors_np, val_anchors_np
+
+    del encoded
 
     model = LiquidLanguageModel(
         vocab_size=vocab_size,
         embedding_dim=args.embedding_dim,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
-        ode_unfolds=args.ode_unfolds,
         dropout=args.dropout,
         zoneout=args.zoneout,
         tie_weights=args.tie_weights,
@@ -567,20 +566,19 @@ def run_training(args, device):
         local_conv=args.local_conv,
         use_checkpoint=args.grad_checkpoint,
         gate_mode=args.gate_mode,
-        ode_solver=args.ode_solver,
-        wiring=args.wiring,
-        ncp_command_frac=args.ncp_command_frac,
-        ncp_motor_frac=args.ncp_motor_frac,
         memory_slots=args.memory_slots,
+        memory_dim=args.memory_dim,
         ffn_mult=args.ffn_mult,
         norm_type=args.norm_type,
+        innovation_memory_dim=args.innovation_memory_dim,
     ).to(device)
+    model.set_sequence_batching(getattr(args, "sequence_batching", False))
 
     if args.gate_mode == "cfc" and args.multi_tau:
         print("[MODEL] --multi-tau is ignored with --gate-mode cfc (there is no tau parameter).")
 
     if resume_payload is not None:
-        load_model_state_compat(model, resume_payload["model_state"])
+        load_model_state_compat(model, resume_payload.pop("model_state"))
 
     base_model = get_base_model(model)
     if args.kernel != "torch":
@@ -591,12 +589,11 @@ def run_training(args, device):
     print(f"[MODEL] Parameters: {parameter_count:,}")
     print(
         f"[MODEL] emb={args.embedding_dim} | hidden={args.hidden_size} | "
-        f"layers={args.num_layers} | unfolds={args.ode_unfolds} | "
+        f"layers={args.num_layers} | "
         f"carry={state_carry} | gate={args.gate_mode} | "
-        f"solver={args.ode_solver if args.gate_mode == 'ltc' else '-'} | "
         f"multi_tau={args.multi_tau if args.gate_mode == 'ltc' else False} | "
-        f"wiring={describe_wiring(model)} | "
-        f"memory_slots={args.memory_slots} | "
+        f"memory_slots={args.memory_slots} | memory_dim={args.memory_dim} | "
+        f"innovation_memory_dim={args.innovation_memory_dim} | "
         f"ffn_mult={args.ffn_mult} | norm={args.norm_type} | "
         f"local_conv={args.local_conv} | ckpt={args.grad_checkpoint}"
     )
@@ -625,16 +622,18 @@ def run_training(args, device):
 
     teacher = None
     if args.teacher_checkpoint:
-        teacher_payload = load_checkpoint_raw(Path(args.teacher_checkpoint), device)
+        teacher_payload = load_inference_checkpoint(Path(args.teacher_checkpoint))
         teacher_tokenizer = tokenizer_from_checkpoint(teacher_payload)
         validate_distillation_tokenizers(tokenizer, teacher_tokenizer)
         teacher = create_model_from_config(
             vocab_size=vocab_size, config=teacher_payload["config"], device=device,
         )
-        load_model_state_compat(teacher, teacher_payload["model_state"])
+        load_model_state_compat(teacher, teacher_payload.pop("model_state"))
         teacher.eval()
+        teacher.set_sequence_batching(getattr(args, "sequence_batching", False))
         for p in teacher.parameters():
             p.requires_grad = False
+        del p, teacher_payload, teacher_tokenizer
         print(f"[KD] Teacher loaded: {args.teacher_checkpoint}")
 
     if args.compile and args.kernel == "triton":
@@ -645,11 +644,13 @@ def run_training(args, device):
             print(f"[COMPILE] Recurrent step compiled (mode={mode_used}).")
         else:
             print("[COMPILE] torch.compile failed — continuing in eager mode.")
+    if getattr(args, "sequence_batching", False):
+        print("[MODEL] Sequence batching enabled for eligible forwards; stochastic training and compiled steps use the original schedule.")
 
     ema = None
     if args.ema_decay > 0:
         if resume_payload is not None and resume_payload.get("ema_state"):
-            ema = EMA.from_state(resume_payload["ema_state"], args.ema_decay)
+            ema = EMA.from_state(resume_payload["ema_state"], args.ema_decay, device=device)
             print(f"[EMA] Восстановлен (updates={ema.updates})")
         else:
             ema = EMA(model, decay=args.ema_decay)
@@ -667,6 +668,7 @@ def run_training(args, device):
         global_step = int(resume_payload.get("global_step", 0))
         best_val = float(resume_payload.get("best_val", resume_payload["val_loss"]))
         print(f"[RESUME] Продолжаем с эпохи {start_epoch + 1}, best_val={best_val:.6f}")
+    del resume_payload
 
     print(f"[SYSTEM] Trainable parameters: {trainable_count:,}")
     print(f"[SYSTEM] {cuda_memory_report()}")
@@ -676,6 +678,7 @@ def run_training(args, device):
         backend=args.log_backend, run_name=run_name, logdir=args.log_dir,
         wandb_project=args.wandb_project, config=vars(args),
     )
+    resources.callback(train_logger.close)
 
     tokens_per_sec = 0.0
     stop_ids = default_stop_ids(tokenizer)
@@ -779,6 +782,11 @@ def run_training(args, device):
                     if memory is not None:
                         memory = memory.detach()
                 hidden = detach_hidden(hidden)
+                # Release vocabulary-sized tensors before the next forward or
+                # evaluation; backward has already consumed this graph.
+                del logits, raw_loss, sum_loss, valid_count, objective_sum, loss
+                if teacher is not None:
+                    del t_logits, s_flat, t_flat, kd_per_token, kd_loss_sum, kd_loss, kd_weights
 
             should_update = (
                 step % args.grad_accumulation == 0
@@ -840,7 +848,7 @@ def run_training(args, device):
 
         val_loss = evaluate(
             model, data, args.batch_size, args.seq_len, epoch_state_carry,
-            device, split, len(encoded), args.eval_batches, amp_dtype,
+            device, split, corpus_tokens, args.eval_batches, amp_dtype,
             train_mask=train_mask, anchors=val_dialogue_anchors,
             anchor_ratio=args.dialogue_anchor_ratio,
         )
@@ -853,7 +861,7 @@ def run_training(args, device):
             ema.copy_to(model)
             val_loss_ema = evaluate(
                 model, data, args.batch_size, args.seq_len, epoch_state_carry,
-                device, split, len(encoded), args.eval_batches, amp_dtype,
+                device, split, corpus_tokens, args.eval_batches, amp_dtype,
                 train_mask=train_mask, anchors=val_dialogue_anchors,
                 anchor_ratio=args.dialogue_anchor_ratio,
             )
@@ -916,6 +924,7 @@ def run_training(args, device):
 
         if ema is not None and using_ema_weights:
             restore_float_state(model, ema_backup)
+        ema_backup = None
 
         if epoch % max(1, args.save_every) == 0 or epoch == total_epochs:
             save_checkpoint(
@@ -943,16 +952,23 @@ def run_training(args, device):
             print(f"[EARLY STOP] {args.patience} эпох без улучшения.")
             break
 
-    train_logger.close()
+    resources.close()
+
+    # The final preview needs one inference model, not both training models,
+    # optimizer moments, EMA and a second full checkpoint on the GPU.
+    del optimizer, scheduler, scaler, ema, teacher, model, base_model
+    del data, train_mask, dialogue_anchors, val_dialogue_anchors
+    gc.collect()  # Compiled callables can contain cycles; collect at this phase boundary.
 
     final_path = checkpoint_path if checkpoint_path.exists() else last_checkpoint_path
-    best_payload = load_checkpoint_raw(final_path, device)
+    best_payload = load_inference_checkpoint(final_path)
     best_tokenizer = tokenizer_from_checkpoint(best_payload)
     best_model = create_model_from_config(
         vocab_size=best_tokenizer.vocab_size,
         config=best_payload["config"], device=device,
     )
-    load_model_state_compat(best_model, best_payload["model_state"])
+    load_model_state_compat(best_model, best_payload.pop("model_state"))
+    best_model.set_sequence_batching(getattr(args, "sequence_batching", False))
     if args.kernel != "torch":
         best_model.set_kernel(args.kernel)
     print("\n========== BEST CHECKPOINT ==========")
@@ -977,15 +993,16 @@ def run_training(args, device):
         "parameters": parameter_count,
         "tokenizer": best_tokenizer.kind,
         "vocab_size": best_tokenizer.vocab_size,
-        "corpus_chars": len(corpus),
-        "corpus_tokens": len(encoded),
+        "corpus_chars": corpus_chars,
+        "corpus_tokens": corpus_tokens,
         "state_carry": state_carry,
         "long_epochs": long_epochs,
         "long_state_carry": long_state_carry,
-        "fim_rate": fim_rate,
-        "kd_topk": args.kd_topk if teacher is not None else None,
+        "kd_topk": args.kd_topk if args.teacher_checkpoint else None,
         "ffn_mult": args.ffn_mult,
         "norm_type": args.norm_type,
+        "memory_dim": args.memory_dim,
+        "innovation_memory_dim": args.innovation_memory_dim,
         "best_epoch": best_payload["epoch"],
         "train_loss": best_payload["train_loss"],
         "val_loss": best_payload["val_loss"],
