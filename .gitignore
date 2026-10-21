@@ -41,3 +41,6 @@ tokenizer*.json
 .idea/
 .vscode/
 .DS_Store
+
+# Root-level desktop runtime diagnostics
+/debug.log

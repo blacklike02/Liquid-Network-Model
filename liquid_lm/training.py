@@ -23,6 +23,7 @@ from .data import (
     load_texts,
 )
 from .layers import chunk_memory_read, chunk_memory_reset, chunk_memory_write
+from .job_control import TrainingControl
 from .model import (
     ARCH_KEYS,
     LiquidLanguageModel,
@@ -435,6 +436,11 @@ def _run_training(args, device, resources):
     data_dir = Path(args.data)
     checkpoint_path = Path(args.checkpoint)
     last_checkpoint_path = Path(args.last_checkpoint)
+    control = TrainingControl.from_environment()
+    if control is not None:
+        control.check_output(checkpoint_path)
+        control.check_output(last_checkpoint_path)
+        control.update(status="preparing")
 
     start_epoch = 0
     global_step = 0
@@ -571,6 +577,7 @@ def _run_training(args, device, resources):
         ffn_mult=args.ffn_mult,
         norm_type=args.norm_type,
         innovation_memory_dim=args.innovation_memory_dim,
+        recurrent_passes=args.recurrent_passes,
     ).to(device)
     model.set_sequence_batching(getattr(args, "sequence_batching", False))
 
@@ -589,7 +596,7 @@ def _run_training(args, device, resources):
     print(f"[MODEL] Parameters: {parameter_count:,}")
     print(
         f"[MODEL] emb={args.embedding_dim} | hidden={args.hidden_size} | "
-        f"layers={args.num_layers} | "
+        f"layers={args.num_layers} | recurrent_passes={args.recurrent_passes} | "
         f"carry={state_carry} | gate={args.gate_mode} | "
         f"multi_tau={args.multi_tau if args.gate_mode == 'ltc' else False} | "
         f"memory_slots={args.memory_slots} | memory_dim={args.memory_dim} | "
@@ -681,6 +688,9 @@ def _run_training(args, device, resources):
     resources.callback(train_logger.close)
 
     tokens_per_sec = 0.0
+    processed_tokens = 0
+    stop_reason = None
+    managed_metrics = {}
     stop_ids = default_stop_ids(tokenizer)
 
     epoch = start_epoch
@@ -844,6 +854,7 @@ def _run_training(args, device, resources):
 
         elapsed = time.perf_counter() - epoch_start
         tokens_seen = args.batch_size * epoch_span_len * args.steps_per_epoch
+        processed_tokens += tokens_seen
         tokens_per_sec = tokens_seen / max(elapsed, 1e-9)
 
         val_loss = evaluate(
@@ -908,7 +919,8 @@ def _run_training(args, device, resources):
         else:
             bad_epochs += 1
 
-        if epoch % 5 == 0 or epoch == total_epochs or improved:
+        stop_reason = control.stop_reason() if control is not None else None
+        if not stop_reason and (epoch % 5 == 0 or epoch == total_epochs or improved):
             preview = model.generate(
                 prompt=args.prompt, tokenizer=tokenizer,
                 max_new_tokens=min(300, args.generate),
@@ -926,7 +938,8 @@ def _run_training(args, device, resources):
             restore_float_state(model, ema_backup)
         ema_backup = None
 
-        if epoch % max(1, args.save_every) == 0 or epoch == total_epochs:
+        stop_reason = control.stop_reason() if control is not None else None
+        if epoch % max(1, args.save_every) == 0 or epoch == total_epochs or stop_reason:
             save_checkpoint(
                 last_checkpoint_path, model, optimizer, scheduler, scaler,
                 epoch, global_step, train_loss, val_loss, best_val,
@@ -935,6 +948,22 @@ def _run_training(args, device, resources):
                 corpus_sha256=corpus_sha,
             )
             print(f"[SAVE] Last -> {last_checkpoint_path}")
+
+        if control is not None:
+            managed_metrics = dict(epoch=epoch, global_step=global_step,
+                processed_tokens=processed_tokens, train_loss=train_loss,
+                validation_loss=candidate, best_validation_loss=best_val,
+                best_checkpoint=checkpoint_path.resolve().relative_to(control.directory).as_posix()
+                    if checkpoint_path.exists() else None,
+                last_checkpoint=last_checkpoint_path.resolve().relative_to(control.directory).as_posix()
+                    if last_checkpoint_path.exists() else None,
+                tokens_per_second=tokens_per_sec, parameters=parameter_count,
+                pytorch=str(torch.__version__), cuda=torch.version.cuda, device=str(device),
+                peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None)
+            control.update(status="running", **managed_metrics)
+            if stop_reason:
+                print(f"[JOB] Checkpoint saved; stopping at epoch boundary: {stop_reason}")
+                break
 
         if args.patience > 0 and bad_epochs >= args.patience:
             if not in_long_stage and long_epochs > 0:
@@ -953,6 +982,12 @@ def _run_training(args, device, resources):
             break
 
     resources.close()
+
+    if control is not None:
+        # Sampling/evaluation belong to explicit, separately budgeted job stages.
+        control.update(status="stopped" if stop_reason else "completed",
+                       stop_reason=stop_reason, **managed_metrics)
+        return
 
     # The final preview needs one inference model, not both training models,
     # optimizer moments, EMA and a second full checkpoint on the GPU.
@@ -1003,6 +1038,7 @@ def _run_training(args, device, resources):
         "norm_type": args.norm_type,
         "memory_dim": args.memory_dim,
         "innovation_memory_dim": args.innovation_memory_dim,
+        "recurrent_passes": args.recurrent_passes,
         "best_epoch": best_payload["epoch"],
         "train_loss": best_payload["train_loss"],
         "val_loss": best_payload["val_loss"],

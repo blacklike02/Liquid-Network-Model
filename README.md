@@ -17,7 +17,7 @@ Instead of self-attention, the model processes text recurrently: each layer's
 hidden state evolves as a dynamical system with learnable time constants. This
 provides fixed-size memory and generation cost linear in sequence length.
 
-> Current version: **v3.7**. The change history is at the end of this document.
+> Current version: **v3.8**. The change history is at the end of this document.
 
 ## Contents
 
@@ -50,7 +50,9 @@ provides fixed-size memory and generation cost linear in sequence length.
   closed-form interpolation, based on Hasani et al., 2022.
 - **Multi-tau**: fast, medium, and slow time-constant banks mixed by a learned
   softmax.
-- One dense recurrent exponential update per token, with the optional Triton backend.
+- One dense recurrent exponential update per cell visit, with the optional Triton backend.
+- Experimental shared-weight depth (`--recurrent-passes`, default 1): repeat
+  the liquid stack with independent temporal states and no extra parameters.
 - A causal depthwise convolution (`k=5`) before the liquid core, carrying
   context across chunks and generation steps.
 - Residual connections, native RMSNorm on cell output, zoneout, and locked
@@ -92,6 +94,8 @@ provides fixed-size memory and generation cost linear in sequence length.
 
 - Temperature, top-k, top-p, and repetition-penalty sampling.
 - One-shot chat requests and an interactive REPL with history.
+- Optional whole-token CUDA Graphs for generation, including chunk-memory
+  boundaries, with a bounded reusable cache and eager fallback.
 - Optional fused Triton kernels for LTC activations and the sub-step tail, with inference and
   experimental first-order training backward on CUDA.
 
@@ -358,6 +362,20 @@ Time is processed in a Python loop: each layer's state is updated one token at
 a time. Projections depending only on `x` (not on `h`) are computed once for
 the whole sequence before the loop.
 
+### Shared-weight recurrent depth
+
+`--recurrent-passes 2` visits the liquid stack twice for each token. Each
+pass has independent temporal states; cell weights and learned initial states
+are shared. FFNs run only on the final pass. ChunkMemory reads and writes the
+final recurrent stream; the causal convolution runs once before the stack.
+Depth above one requires equal embedding and hidden widths. The default of
+one preserves the existing equations and parameter layout.
+
+This is computational depth, not additional ODE substeps or a demonstrated
+reasoning capability. Checkpoints record the pass count; changing it at
+inference changes the model's semantics and is not a supported conversion.
+Compare held-out quality and compute budgets before enabling additional passes.
+
 ### LiquidCell — `ltc` mode (default)
 
 The cell models LTC-inspired dynamics with an input/state-dependent time constant:
@@ -552,6 +570,47 @@ network is initialized for a stable, moderately slow starting dynamic.
 
 ## How training works
 
+### Unattended runs
+
+`echo_jobs.py` runs a fixed recipe in a separate local controller, without
+agent polling or LLM/API calls. Prepare your corpus and review
+[`examples/unattended_training.json`](examples/unattended_training.json)
+before launch. The example requests CUDA/BF16/Triton and uses validation to
+select weights, followed by one fixed-prompt sample; it does not include a
+separate test-set evaluation.
+
+```bash
+python echo_jobs.py launch --recipe examples/unattended_training.json --run-dir runs/echo_unattended_01
+python echo_jobs.py status runs/echo_unattended_01
+python echo_jobs.py result runs/echo_unattended_01
+python echo_jobs.py stop runs/echo_unattended_01
+```
+
+Launch confirms controller startup and returns. Stages run sequentially in
+isolated subdirectories; an existing run directory is rejected. Outputs include
+`recipe.json`, `status.json`, `result.json`, `report.md`, per-stage logs and
+checkpoints. Status/result commands use only the standard library. An unfinished
+`result` command returns exit code 2. The final JSON includes stage summaries
+and bounded log tails, so it can be collected in one later request.
+
+The example's three-hour budget includes a five-minute finalization reserve
+and two-minute stop grace. Training receives its stop request seven minutes
+before the total deadline. Native training checks at epoch boundaries, completes
+validation and saves a last checkpoint even outside `--save-every`. Managed
+training leaves final sampling to the explicit finalization stage; ordinary CLI
+training is unchanged. Use short enough epochs to fit the stop grace.
+
+Cancellation skips queued stages. An unresponsive stage is terminated with
+its descendants after the grace/deadline, preserving previously written
+checkpoints; forced training termination skips finalization. No automatic
+restart, recipe adjustment or agent-written completion marker is required.
+The controller also bounds finalization and records deadline overruns.
+
+Windows launch hides the console; stage ownership uses Job Objects. Completion
+does not itself send a chat message: collect the result later. Machine shutdown,
+sleep or host process restrictions can interrupt execution; stale heartbeats
+are exposed by `status`, without claiming an interrupted job completed.
+
 ### TBPTT with state carry
 
 The corpus is sampled in windows of `span = seq_len × state_carry`, processed as
@@ -631,6 +690,8 @@ Modes are `default`, `reduce-overhead` (CUDA Graphs), and `max-autotune` (not
 recommended for these small matrices because it is slow and often provides no
 benefit). If compilation fails, the program falls back to `default` and then
 eager mode. For `--generate-only`, compilation uses evaluation mode.
+`--cuda-graphs` below is a separate whole-token inference backend; choose
+either it or `--compile`.
 
 ### Gradient checkpointing (`--grad-checkpoint`)
 
@@ -727,6 +788,62 @@ boundary.
 > `--chat` and `--chat-repl` enable generation themselves; `--generate-only`
 > is not needed.
 
+### CUDA Graph generation
+
+```bash
+python liquid_text_model.py --chat-repl --device cuda --kernel triton \
+  --sequence-batching --cuda-graphs --checkpoint liquid_text_best.pt
+```
+
+`--cuda-graphs` is opt-in for `--generate-only`, `--chat` and `--chat-repl`.
+It captures the complete one-token model forward, including convolution,
+liquid depth passes, FFNs, readout and chunk-memory updates. Prompt processing
+and sampling retain their existing paths, including seeded RNG consumption,
+stop tokens and repetition penalties. It works with Torch and Triton backends;
+`--compile` is mutually exclusive. Training does not use this backend.
+
+The first use warms and captures the required transitions, so a short first
+request can be slower. Later requests reuse at most four graphs for one
+shape/precision configuration. Each prompt resets all session state. Normal
+weight updates, device/dtype moves and supported execution-setting changes
+invalidate the cache. CPU or unsupported capture falls back to eager decode;
+unrecoverable CUDA/replay errors propagate. The CLI prints runtime counters
+to distinguish active replay from fallback.
+
+Python callers can use `model.set_cuda_graphs(True)`, inspect
+`model.cuda_graph_stats()`, and release/retry captures with
+`model.clear_cuda_graph_cache()`. Clear explicitly after untracked `.data`
+edits or custom runtime changes. Graphs are runtime resources and are not
+stored in checkpoint tensor state. Captures require graph-safe RNG APIs in
+PyTorch (tested on 2.11); older builds without them fall back to eager.
+
+Measured on 21 October 2026: RTX 5050 Laptop, PyTorch 2.11.0+cu128, LTC/Triton,
+15.17M saved weights, three memory slots of width 64, chunk size 64, one depth
+pass, TF32 off. Seven alternating pairs generated 128 tokens from an eight-token
+BPE prompt. Warm medians include prompt processing, memory, sampling and text
+decoding; weight loading and capture are excluded.
+
+| Precision | Eager | CUDA Graphs | Median paired speedup | First graph request |
+| --- | ---: | ---: | ---: | ---: |
+| FP32 | 937 ms | 351 ms | 2.64x | 2.16 s |
+| BF16 autocast | 499 ms | 207 ms | 2.40x | 1.87 s |
+
+The first-request column includes generation plus warmup/capture. Outputs and
+final CUDA RNG states matched for every pair, with no fallback. Unlocked clocks
+and Windows scheduling limit precision; these are local latency observations,
+not training, model-quality or concurrent-serving results. BF16 here uses the
+benchmark's autocast context; CLI `--amp` remains a training option.
+
+Run an independent random-weight measurement with the same parameter count:
+
+```bash
+python benchmark_cuda_graphs.py --hidden 768 --vocab 4096 --kernel triton --precision fp32 --pairs 7 --output runs/cuda_graphs/generation.json
+```
+
+Add `--checkpoint path/to/model.pt` to benchmark supported saved weights, or
+`--precision bf16` for autocast. Tokenization and prompt length depend on the
+checkpoint, so random-weight and saved-weight timings are separate cases.
+
 ### Which model generation uses
 
 The file from `--checkpoint` (default `liquid_text_best.pt`) is used. The
@@ -806,6 +923,7 @@ model-level timings. Windows was tested with `triton-windows 3.8.0.post28`.
 | `--embedding-dim` | `384` | Embedding size |
 | `--hidden-size` | `384` | Hidden-state size |
 | `--num-layers` | `2` | Number of liquid layers |
+| `--recurrent-passes` | `1` | Shared-weight stack visits per token; independent temporal states, final-pass FFNs |
 | `--dropout` | `0.05` | Dropout, `[0, 1)` |
 | `--zoneout` | `0.1` | Zoneout, `[0, 1)` |
 | `--tie-weights` / `--no-tie-weights` | enabled | Tie embedding and output |
@@ -851,6 +969,7 @@ model-level timings. Windows was tested with `triton-windows 3.8.0.post28`.
 | `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:1`, … |
 | `--amp` | `auto` | `auto`, `fp16`, `bf16`, `off` |
 | `--compile` | disabled | Compile recurrent step |
+| `--cuda-graphs` / `--no-cuda-graphs` | disabled | Cached whole-token CUDA generation/chat; incompatible with `--compile` |
 | `--compile-mode` | `default` | `default`, `reduce-overhead`, `max-autotune` |
 
 ### Checkpoints and logging
@@ -1118,12 +1237,18 @@ The model is recurrent, so the time loop is sequential:
 
 ```
 liquid_text_model.py          # thin command-line entry point
+echo_jobs.py                  # detached local recipe controller and status/result/stop CLI
+examples/
+└── unattended_training.json  # example CUDA training and final sampling recipe
 liquid_lm/
 ├── __init__.py               # environment setup before importing torch
 ├── __main__.py               # python -m liquid_lm
 ├── cli.py                    # CLI, argument validation, mode dispatch
+├── cuda_graphs.py            # bounded whole-token inference captures and recovery
 ├── data.py                   # corpus readers, cleaning and dialogue parsing
 ├── inference.py              # generation-only and interactive chat
+├── job_control.py            # epoch-boundary checkpoint/stop bridge
+├── job_process.py            # owned subprocess trees on Windows and POSIX
 ├── layers.py                 # liquid cells, native normalization, chunk memory, Triton kernel
 ├── associative.py            # experimental innovation-gated recurrent memory
 ├── model.py                  # LiquidLanguageModel, generation and checkpoint I/O
@@ -1136,7 +1261,10 @@ requirements.txt              # Python dependencies
 tests/
 ├── test_regressions.py       # sequence, masking, resume and numerical regressions
 ├── test_audit.py             # KD, checkpoint writes, prefill and AMP state
+├── test_cuda_graphs.py       # graph parity, RNG recovery, cache lifetime and fallback
 ├── test_gpu.py               # CUDA parity, AMP, scaler and checkpoint tests
+├── test_recurrent_depth.py   # shared weights, independent streams and checkpoint depth
+├── test_unattended_jobs.py   # detached completion, deadlines, cancellation and native stops
 ├── test_innovation_memory.py # memory equations, causality, carry, gradients and AMP
 ├── test_memory_benchmarks.py # overwrite/query labels and ablation initialization
 ├── test_memory_language_benchmark.py # vocabulary and held-out split boundaries
@@ -1145,6 +1273,7 @@ tests/
 └── check_triton_mixed.py     # standalone mixed-dtype/full-model Triton checks
 benchmark_model.py            # CPU forward/backward, generation and KD
 benchmark_gpu.py              # synchronized CPU/CUDA/Triton/compiled comparisons
+benchmark_cuda_graphs.py      # paired complete-generation eager/CUDA Graph timings
 benchmark_triton_tail.py       # isolated LTC tail forward/backward
 benchmark_innovation.py       # synthetic associative recall with parameter control
 benchmark_memory_validation.py # ablations, overwrite/query tasks and time budgets
@@ -1176,6 +1305,18 @@ missing package never breaks unrelated parts of the program.
 python -m unittest discover -s tests -v
 python benchmark_gpu.py --device both --cases train_realistic16 generate128 --precisions fp32 --threads 1 --warmup 3 --repeats 7 --output runs/benchmark_torch.json
 ```
+
+### v3.8 publication validation: 21 October 2026
+
+Fresh full discovery passed **140/140**, with no skips, on Windows 11,
+RTX 5050 Laptop, PyTorch 2.11.0+cu128 and Triton Windows 3.8.0.post28.
+CPU-only PyTorch 2.14.1+cpu passed **115**, with **25 expected skips**
+(24 GPU checks and one optional-tokenizers check). Coverage includes shared
+recurrent depth, CUDA Graph parity/recovery and unattended process control.
+The separate mixed-dtype Triton checker also passed all **18 cases**.
+These are correctness checks; earlier performance and quality measurements
+below apply to their stated revisions and conditions. See
+[CONTRIBUTING](CONTRIBUTING.md#tests-and-reproducible-measurements) for commands.
 
 ### RMSNorm-only validation: 20 October 2026
 
@@ -1400,8 +1541,32 @@ manifests and detailed local results live under the Git-ignored `runs/english_sm
 
 ## Change history
 
-The current training interface focuses on dense LTC/CfC cells, native RMSNorm
-and compact chunk memory. See the compatibility notes for retired options.
+### v3.8 — 21 October 2026: recurrent depth, CUDA Graphs and unattended jobs
+
+- Added experimental `--recurrent-passes`: shared liquid-stack weights with
+  independent temporal states, FFNs on the final pass and checkpointed depth
+  metadata. The default remains one; extra passes need quality evaluation.
+- Added opt-in `--cuda-graphs` for generation and chat, including chunk-memory
+  boundaries, isolated prompt states, bounded capture reuse and RNG-safe
+  capture fallback. Sampling stays eager; `--compile` is a separate backend.
+- Added `echo_jobs.py launch/status/result/stop`, a reviewed-recipe workflow,
+  owned process trees, deadline/finalization budgets and native checkpointing
+  before an epoch-boundary stop. The example recipe requires local data.
+- Added regression tests and a paired full-generation CUDA Graph benchmark.
+  See [CONTRIBUTING](CONTRIBUTING.md#tests-and-reproducible-measurements) for
+  commands, measured conditions and limitations. No new language-quality
+  improvement is claimed by these execution and workflow changes.
+- Preserved RMSNorm-only compatibility, tokenizer IDs and existing checkpoint
+  tensor names. Missing recurrent-depth metadata means one pass; CUDA Graph
+  caches and controller state are runtime data, not model architecture.
+
+### 20 October 2026: Echo naming and RMSNorm-only interface
+
+- Named the current model Echo and documented the planned Pantheon family.
+- Standardized on native RMSNorm and compact occupied chunk memory. Retired
+  NCP, FIM augmentation, Heun and extra ODE unfolds are rejected explicitly;
+  reserved token IDs remain unchanged. LayerNorm weights require an earlier
+  compatible revision. See the checkpoint compatibility notes.
 
 ### 19 October 2026: numerical fixes and CUDA validation
 

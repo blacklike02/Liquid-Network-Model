@@ -34,6 +34,11 @@ Run all commands from the repository root. The `liquid_lm` package uses a flat
 module layout:
 
 - `model.py`: language model, generation, checkpoint I/O and architecture keys.
+- `cuda_graphs.py`: bounded inference captures, static session buffers and RNG-safe recovery.
+- `echo_jobs.py`, `job_control.py`, `job_process.py`: standalone recipe controller,
+  native checkpoint/stop bridge and owned subprocess trees.
+- `examples/unattended_training.json`: example CUDA/BF16/Triton recipe requiring
+  a local corpus; review its budget and finalization before launching it.
 - `layers.py`: LTC/CfC cells, native RMSNorm, compact/legacy ChunkMemory and the optional Triton path.
 - `training.py`, `optim.py`: training, distillation, evaluation and optimizers.
 - `data.py`, `tokenizer.py`: corpus loading and tokenization.
@@ -74,8 +79,201 @@ module layout:
   benchmark labels, control initialization and split boundaries.
 - `tests/test_research.py`: averaging compatibility, token semantics, nonfinite
   weights, tensor/buffer invariants and overflow protection.
+- `tests/test_recurrent_depth.py`: shared weights, independent state streams,
+  depth metadata, streaming/checkpointed gradients and CUDA/Triton parity.
+- `tests/test_cuda_graphs.py`: decode parity, RNG-safe recovery, invalidation,
+  bounded caches and runner lifetime.
+- `tests/test_unattended_jobs.py`: detached execution, process ownership,
+  deadlines, finalization, cancellation and native checkpoint-before-stop.
+- `benchmark_cuda_graphs.py`: paired full-generation timings with first-use
+  capture overhead reported separately.
 
 ## Tests and reproducible measurements
+
+Publication verification for software **v3.8**, 21 October 2026: fresh full
+discovery passed **140/140**, no skips, on Windows 11 / RTX 5050 Laptop /
+PyTorch 2.11.0+cu128 / triton-windows 3.8.0.post28. CPU-only PyTorch
+2.14.1+cpu passed **115**, with **25 expected skips** (24 GPU checks and one
+optional-tokenizers check). The separate `tests/check_triton_mixed.py` checker
+passed all **18 cases**. Run full discovery and the standalone checker with
+the commands below; use fresh workspace-local compiler caches. These are
+correctness results, without a new training-quality or performance claim.
+
+### Unattended controller
+
+`python echo_jobs.py launch --recipe examples/unattended_training.json` starts
+a standalone standard-library controller. Prepare data and inspect the recipe
+first; this command starts real training. `status`, `result` and `stop` take the
+run directory. Launch never overwrites an existing directory or resumes a job.
+There are no LLM calls, network notifications or agent approval markers in the
+execution loop. Logs/checkpoints remain local under the selected workspace run.
+
+Version-one recipes specify positive `budget_seconds`, `finalization_seconds`
+and `stop_grace_seconds`; the latter two sum to less than the total budget.
+Every stage has a unique portable `name`, `phase` (`train` or `finalize`) and
+`command` argument array. All training stages precede finalization. No shell
+string concatenation is used. Literal replacements `{python}`, `{repo}`,
+`{run}` and `{stage}` resolve to the current interpreter, repository, run and
+stage directory. Other braces are preserved. Stage working directories are
+isolated; use explicit paths to consume preceding outputs.
+
+Training stop is requested at `budget - finalization - grace`, with forced
+termination at `budget - finalization`. Final stages share the remaining
+budget. A cooperative deadline permits finalization; user stop or forced
+training termination cancels queued work. A nonzero exit is a failure even
+during a deadline stop. Cleanup can add latency; result JSON records overrun.
+
+`ECHO_JOB_CONTROL_DIR` activates native training's optional file bridge. It
+must equal the stage cwd; checkpoint outputs must stay inside that directory.
+Check stop requests on complete epoch boundaries, after validation and safe
+checkpoint writes. Force a last checkpoint outside the normal save schedule.
+Managed training publishes `training_progress.json` and returns without its
+ordinary final sampling/info export; plan those as explicit finalization stages.
+Do not change default training behavior, equations or checkpoint meanings.
+
+`summary` optionally names a stage-local JSON object (default
+`training_progress.json`, maximum 4096 bytes). Missing summaries are recorded
+as null; malformed, oversized or escaped summaries fail the job. Result JSON
+also includes at most 2048 bytes from each stage log, relative log paths,
+recipe hash, exit/status information and elapsed time. Snapshots replace files
+atomically; progress does not grow an unbounded metrics history.
+The JSON job exit code is 0 for completion, 1 for failure, 124 for a deadline
+and 130 for user stop. The inspection CLI returns 2 for an unfinished result,
+1 for failure and 0 for other terminal outcomes; inspect the JSON status to
+distinguish a normal completion from a handled stop/deadline.
+
+Windows stages start behind an stdin gate until assigned to a private
+kill-on-close Job Object, so descendants inherit ownership. Closing that job
+also removes abandoned descendants after a stage exits. The controller itself
+is outside its stage jobs and launches hidden. POSIX uses a process group;
+intentional process-group escape is unsupported. Do not promise persistence
+through OS shutdown or restrictive host jobs. A stale heartbeat flags missing
+supervision; it cannot manufacture a result after an abrupt controller death.
+
+```powershell
+python -m unittest discover -s tests -p test_unattended_jobs.py -v
+```
+
+Tests use temporary scripts/corpora/weights. They cover detached launcher exit,
+sequential finalization, duplicate-start rejection, cancellation of descendants,
+cooperative and forced deadlines, failure during stop, total finalization
+budget, and native CPU checkpoint-before-stop. These are controller correctness
+checks, without language-quality or training-speed claims. Separate held-out
+test evaluation is recipe-specific and must follow validation-only selection.
+
+Verification on 21 October 2026: full discovery passed **140/140**, no skips,
+in 88.547 s on RTX 5050 Laptop / PyTorch 2.11.0+cu128 / CUDA 12.8. CPU-only
+PyTorch 2.14.1+cpu passed **115**, with **25 expected skips** (24 GPU checks,
+one optional tokenizers), in 35.039 s. A separate invocation confirmed the
+controller completed after its launching tool call had returned. A disposable
+6,869-parameter CUDA BF16/Triton model then completed two updates with two
+shared passes, compact/associative memory and FFNs; its next stage generated
+eight tokens with CUDA Graphs (three captures, seven replays, zero fallbacks).
+That smoke was solely a workflow check, not a language-quality or speed result.
+The final nine controller tests passed again in 23.195 s after JSON validation
+and path compatibility refinements.
+
+### Whole-token CUDA Graphs
+
+`--cuda-graphs` is an inference execution choice, not an architecture field.
+Keep it out of `ARCH_KEYS` and checkpoint tensor state. Generation owns one
+runner with at most four `(read_memory, write_memory)` variants. Copies must
+include every recurrent depth stream, convolution tail, associative state and
+the complete memory buffer/occupancy. Preserve the original read-before-token
+and write-after-token boundaries, including partial prompts and chunk size one.
+
+Sampling stays eager to preserve RNG consumption, filtering, penalties and stop
+behavior. Capture uses isolated graph-safe generator state: a failed capture
+must not poison the caller's sampler. Restore the CUDA stream and scratch
+states before eager fallback. A failed replay can have partially updated state;
+propagate it instead of consuming the token twice. Registered Python forward
+hooks use eager decode because their side effects are not replayed.
+
+Versioned weights/buffers, module settings, autocast and TF32 configuration
+invalidate captures. Unversioned inference parameters rebuild per request;
+construct/load the model outside `inference_mode` for cross-request reuse.
+Untracked `.data` edits/custom code changes need `clear_cuda_graph_cache()`.
+Model copies exclude captures and locks. Keep runner-to-model references weak
+and verify destruction with cyclic GC disabled. Generations on the same model
+are serialized. Cold capture requires no other CUDA work in this process;
+this implementation is not a concurrent-request scheduler.
+
+```powershell
+python -m unittest discover -s tests -p test_cuda_graphs.py -v
+python benchmark_cuda_graphs.py --hidden 768 --vocab 4096 --kernel triton --precision fp32 --pairs 7 --output runs/cuda_graphs/generation.json
+```
+
+`tests/test_cuda_graphs.py` covers Torch/Triton, LTC/CfC, FP32/BF16/FP16,
+compact/legacy/disabled memory, associative state, shared depth, convolution,
+MLP head, partial chunks, EOS, seeded sampling and RNG-state equivalence.
+It also exercises a real prohibited synchronization during capture, restored
+state/stream/sampling afterward, cache invalidation and bounded retained memory.
+Benchmark the ordinary generation API, reporting first-use overhead separately
+from warm alternating pairs; verify that replay counters are positive and
+fallback counters are zero. Do not extrapolate prototype kernel timings to
+chat latency or infer training speed/quality gains from graph replay.
+
+Measurements on 21 October 2026 used RTX 5050 Laptop, PyTorch 2.11.0+cu128,
+CUDA 12.8, one CPU thread, TF32 off and sequential GPU workloads. Both modes
+held identical model copies; peak allocation includes both copies. The model
+has 15,168,902 parameters, LTC/Triton, two layers, one shared-depth pass, FFN
+multiplier one, three 64-wide memory slots and 64-token chunks. Each case used
+seven alternating pairs and 128 output tokens.
+
+| Weights / precision | Prompt tokens | Warm eager median | Warm graph median | Median paired ratio | First graph request |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Random character model / FP32 | 32 | 1,002 ms | 416 ms | 2.43x | 2.96 s |
+| Saved BPE model / FP32 | 8 | 937 ms | 351 ms | 2.64x | 2.16 s |
+| Same saved BPE model / BF16 autocast | 8 | 499 ms | 207 ms | 2.40x | 1.87 s |
+
+Warm times include prompt, boundary memory operations, sampling, scalar token
+reads and text decoding. First graph requests also include warmup/capture and
+any first-use compilation, but exclude checkpoint loading. Every output and
+final CUDA RNG state matched. Each case retained three graphs with zero
+fallbacks. Clocks were unlocked; these observed ratios include Windows
+scheduling noise. The saved model came from interrupted pretraining and is
+used solely for execution parity/performance, without a new quality claim.
+The command above reproduces the random-weight case; add `--checkpoint` for
+local saved weights or `--precision bf16` for autocast. CLI `--amp` remains
+training-only.
+
+Final verification on 21 October 2026: **131/131 passed** on CUDA/Triton
+(28.579 s test-runner time, no skips). CPU-only PyTorch 2.14.1+cpu passed
+**106**, with **25 expected skips** (24 GPU checks and one optional-tokenizers
+check), in 7.845 s. Five inference CLI scenarios passed: CUDA generation,
+one-shot chat, two-turn REPL with graph reuse, CPU fallback and CPU eager.
+The CPU outputs matched. Tests used disposable random weights; no model
+training was resumed. TF32 signatures cover both modern per-operator settings
+and older APIs without mixing their getters.
+
+### Shared-weight recurrent depth
+
+`--recurrent-passes` is opt-in and defaults to one. Repeated liquid-stack
+visits share cell weights and learned initial states, with separate temporal
+buffers for each pass. FFNs run on the final pass; ChunkMemory uses the final
+liquid stream. Keep convolution and associative side-state indexing separate.
+Record the actual pass count in checkpoint metadata and preserve the one-pass
+meaning when metadata is absent. Multiple visits are a compute/quality
+experiment; they do not establish reasoning ability or restore ODE substeps.
+
+```powershell
+python -m unittest discover -s tests -p test_recurrent_depth.py -v
+python -m unittest discover -s tests -v
+```
+
+`tests/test_recurrent_depth.py` covers shared parameters, independent B1/B2
+state buffers, LTC/CfC streaming and sequence-batched outputs and gradients,
+checkpointed backward, compact/associative state layout, configuration and
+CUDA/Triton FP32/BF16 optimizer steps. Compare quality at matched token budgets
+and separately at matched wall time; extra passes consume additional compute
+with the same parameter count. Keep final test data out of depth selection.
+
+The CPU suite on 20 October 2026 passed **102 tests with 21 expected GPU skips**
+(123 discovered, 20.313 seconds, PyTorch 2.14.1+cpu). Three additional BPE CLI
+smokes passed: two-pass training, checkpoint-controlled resume and generation.
+The resume requested one pass and correctly restored two from the checkpoint.
+GPU skips do not establish CUDA correctness. Earlier results below describe
+their respective revisions.
 
 Use a Python environment with the required dependencies and a CUDA-enabled
 PyTorch build for GPU tests. CPU-only PyTorch cannot use CUDA even when the

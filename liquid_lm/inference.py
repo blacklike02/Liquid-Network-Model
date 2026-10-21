@@ -26,6 +26,7 @@ def run_chat_repl(args, device):
     load_model_state_compat(model, checkpoint.pop("model_state"))
     model.set_sequence_batching(getattr(args, "sequence_batching", False))
     model.eval()
+    model.set_cuda_graphs(getattr(args, "cuda_graphs", False))
     if args.kernel != "torch":
         model.set_kernel(args.kernel)
     if args.compile and args.kernel == "triton":
@@ -63,6 +64,8 @@ def run_chat_repl(args, device):
             memory_chunk_size=int(checkpoint.get("config", {}).get("seq_len", 128)),
             device=device, stop_token_ids=stop_ids, only_new=True,
         )
+        if getattr(args, "cuda_graphs", False):
+            print(f"[CUDA GRAPHS] {model.cuda_graph_stats()}")
         answer = text.strip()
         print(f"Бот: {answer}\n")
         history += f"{answer}\n{EXAMPLE_END_TAG}\n"
@@ -83,6 +86,7 @@ def run_generate_only(args, device):
     model.eval()
     if args.kernel != "torch":
         model.set_kernel(args.kernel)
+    model.set_cuda_graphs(getattr(args, "cuda_graphs", False))
     if args.compile and args.kernel == "triton":
         print("[COMPILE] Skipping torch.compile: --kernel triton uses the eager recurrent step.")
     elif args.compile:
@@ -110,6 +114,8 @@ def run_generate_only(args, device):
         device=device, stop_token_ids=stop_ids, only_new=args.chat,
     )
     elapsed = time.perf_counter() - start
+    if getattr(args, "cuda_graphs", False):
+        print(f"[CUDA GRAPHS] {model.cuda_graph_stats()}")
     print("\n========== GENERATED ==========\n")
     if args.chat:
         print(text.strip())

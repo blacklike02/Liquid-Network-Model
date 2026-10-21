@@ -38,6 +38,8 @@ relevant parts of `CONTRIBUTING.md` before changing behavior.
 - `liquid_lm/training.py`, `optim.py`: training, evaluation, KD, optimizers.
 - `liquid_lm/data.py`, `tokenizer.py`: corpus loading, split policy, tokenization.
 - `liquid_lm/inference.py`: generation and interactive chat.
+- `echo_jobs.py`, `liquid_lm/job_control.py`, `job_process.py`: standalone job
+  controller, native epoch-boundary stop bridge and owned process trees.
 - `tests/`: unittest regression and optional CUDA/Triton checks.
 - `benchmark_*.py`, `research_liquid.py`: reproducible measurements and experiments.
 
@@ -66,6 +68,11 @@ relevant parts of `CONTRIBUTING.md` before changing behavior.
   Carrying more chunks extends forward context, not the gradient horizon.
 - Keep convolution causal and carry its tail across chunks. Preserve streaming,
   full-sequence, sequence-batched and activation-checkpointed equivalence.
+- Optional `recurrent_passes` repeats the shared liquid stack with pass-major,
+  independent temporal states; FFNs run on the final pass only. ChunkMemory
+  targets the final recurrent stream. Default one preserves existing behavior.
+  This is depth recurrence, not restored ODE unfolds or established reasoning.
+  Missing checkpoint depth metadata means one; save the actual model's count.
 - Keep tokenizer IDs, saved architecture settings, data split semantics and
   checkpoint tensor meanings stable. Integrate architecture fields through
   `ARCH_KEYS`, defaults, CLI, training and save/load paths where applicable.
@@ -73,6 +80,12 @@ relevant parts of `CONTRIBUTING.md` before changing behavior.
 - The existing Triton path accelerates LTC operations and supports first-order
   training gradients. CfC uses the Torch path. Do not assume a custom kernel is
   faster: compare outputs, gradients and synchronized full-model timings.
+- `--cuda-graphs` is opt-in generation/chat only, separate from `--compile`.
+  Its cache is runtime state, not architecture metadata. Keep every recurrent,
+  convolution and memory state isolated per prompt; preserve chunk boundaries.
+  Sampling stays eager. Capture failure must restore states, CUDA stream and
+  caller RNG before fallback; replay failures must propagate. Cache invalidation
+  and weak runner ownership are required. No continuous-request scheduler exists.
 
 ## Verification
 
@@ -107,6 +120,37 @@ git diff --check
   skips on PyTorch 2.14.1+cpu. Six BPE CLI train/resume/generate scenarios passed
   across CPU and CUDA BF16/Triton. These are historical results, not evidence
   that a later change was tested. Earlier LayerNorm results are historical too.
+- CUDA Graph integration results on **21 October 2026**: 131/131 passed on the
+  same RTX 5050/PyTorch 2.11.0+cu128 environment; CPU 2.14.1+cpu passed 106
+  with 25 expected skips (24 GPU, one optional tokenizers). Five inference CLI
+  scenarios passed. See CONTRIBUTING for measured generation latency and scope.
+- Unattended controller verification on **21 October 2026**: 140/140 passed on
+  CUDA; CPU passed 115 with the same 25 expected skips. Detached completion and
+  a disposable CUDA BF16/Triton train-to-graph-generation recipe also passed.
+
+## Unattended training and agent usage
+
+- Use `echo_jobs.py launch/status/result/stop` and a reviewed JSON recipe.
+  `examples/unattended_training.json` is a template, not permission to run it.
+- Default to unattended training. Before launch, fix the recipe, data splits,
+  seed, time budget, checkpoint selection and final evaluation/report steps.
+  Include finalization in the budget; checkpoint before a graceful deadline stop.
+- Use an independent local controller for training and finalization, without
+  LLM/API calls. It must save logs/checkpoints, bounded progress and a compact
+  `result.json` for success, user stop, deadline or failure. Do not leave it
+  waiting for an agent-written marker or an interactive decision.
+- Verify startup with a bounded check, then report the run directory and end
+  the turn. On Windows, launch background helpers with a hidden window. Verify
+  process independence before claiming it survives the agent's turn ending.
+- Do not keep an agent turn open through training, poll epochs, repeatedly read
+  logs, sleep/recheck, run unrelated audits or alter the active recipe. Local
+  scripts may monitor progress without involving the agent.
+- Read the compact result once when the user requests it or an actually
+  configured completion event arrives; inspect bounded log tails on failure.
+  Do not promise automatic notification or self-resumption without that event.
+- A user stop cancels the controller and its children, including queued stages.
+  Preserve recoverable checkpoints; never restart a stopped run automatically.
+  No new training is authorized by this workflow rule alone.
 
 ## Local files, cleanup and handoff
 

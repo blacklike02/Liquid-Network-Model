@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "budget_seconds": 10800,
+  "finalization_seconds": 300,
+  "stop_grace_seconds": 120,
+  "stages": [
+    {
+      "name": "train",
+      "phase": "train",
+      "command": [
+        "{python}", "{repo}/liquid_text_model.py",
+        "--data", "{repo}/data", "--tokenizer", "bpe", "--vocab-size", "4096",
+        "--embedding-dim", "384", "--hidden-size", "384", "--num-layers", "2",
+        "--ffn-mult", "1", "--memory-slots", "3", "--memory-dim", "64",
+        "--state-carry", "4", "--seq-len", "64", "--batch-size", "16",
+        "--epochs", "1000", "--steps-per-epoch", "25", "--eval-batches", "10",
+        "--device", "cuda", "--kernel", "triton", "--sequence-batching",
+        "--amp", "bf16", "--checkpoint", "best.pt", "--last-checkpoint", "last.pt",
+        "--save-every", "1", "--generate", "0", "--seed", "42"
+      ]
+    },
+    {
+      "name": "sample",
+      "phase": "finalize",
+      "command": [
+        "{python}", "{repo}/liquid_text_model.py", "--generate-only",
+        "--checkpoint", "{run}/train/best.pt", "--device", "cuda",
+        "--kernel", "triton", "--sequence-batching", "--cuda-graphs",
+        "--prompt", "Once upon a time", "--generate", "128", "--seed", "42"
+      ]
+    }
+  ]
+}

@@ -5,6 +5,9 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import threading
+import warnings
+from contextlib import nullcontext
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -12,6 +15,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
 from .associative import InnovationMemory
+from .cuda_graphs import CudaGraphDecode, CudaGraphUnavailable, decode_signature, serialize_graph_generation
 from .layers import (
     ChunkMemory,
     CompactChunkMemory,
@@ -113,6 +117,7 @@ class LiquidLanguageModel(nn.Module):
         norm_type: str = "rms",
         innovation_memory_dim: int = 0,
         memory_dim: int = 0,
+        recurrent_passes: int = 1,
     ) -> None:
         super().__init__()
         validate_retired_architecture(ode_unfolds, ode_solver, wiring)
@@ -120,6 +125,10 @@ class LiquidLanguageModel(nn.Module):
             raise ValueError("memory_dim and memory_slots must be >= 0")
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
+        if isinstance(recurrent_passes, bool) or not isinstance(recurrent_passes, int) or recurrent_passes < 1:
+            raise ValueError("recurrent_passes must be a positive integer")
+        if recurrent_passes > 1 and embedding_dim != hidden_size:
+            raise ValueError("recurrent_passes > 1 requires embedding_dim == hidden_size")
         if ffn_mult < 0:
             raise ValueError("ffn_mult must be >= 0 (0 disables the FFN blocks)")
         if innovation_memory_dim < 0:
@@ -134,6 +143,8 @@ class LiquidLanguageModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.recurrent_passes = recurrent_passes
+        self.recurrent_state_count = num_layers * recurrent_passes
         self.dropout_rate = dropout
         self.zoneout = zoneout
         self.tie_weights = tie_weights
@@ -233,6 +244,106 @@ class LiquidLanguageModel(nn.Module):
         self._step_fn = None
         self._sequence_batching = False
         self._kernel = "torch"
+        self._init_cuda_graph_runtime()
+
+    def _init_cuda_graph_runtime(self, enabled=False):
+        self._cuda_graphs_enabled = bool(enabled)
+        self._cuda_graph_runner = None
+        self._cuda_graph_signature = None
+        self._cuda_graph_failed_signature = None
+        self._cuda_graph_last_error = None
+        self._cuda_graph_lock = threading.RLock()
+        self._cuda_graph_captures = 0
+        self._cuda_graph_replays = 0
+        self._cuda_graph_fallbacks = 0
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        # Captured graphs/locks are runtime resources, not portable model state.
+        state = {**state, "_cuda_graph_runner": None, "_cuda_graph_signature": None,
+                 "_cuda_graph_failed_signature": None, "_cuda_graph_lock": None}
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._init_cuda_graph_runtime(state.get("_cuda_graphs_enabled", False))
+
+    def clear_cuda_graph_cache(self):
+        """Release captures; also call after untracked parameter .data edits."""
+        with self._cuda_graph_lock:
+            self._cuda_graph_runner = None
+            self._cuda_graph_signature = None
+            self._cuda_graph_failed_signature = None
+            self._cuda_graph_last_error = None
+
+    def set_cuda_graphs(self, enabled: bool):
+        """Opt into cached whole-token CUDA inference; never used by training."""
+        with self._cuda_graph_lock:
+            if enabled and self._step_fn is not None:
+                raise ValueError("CUDA Graphs and a compiled step are separate inference backends")
+            self.clear_cuda_graph_cache()
+            self._cuda_graphs_enabled = bool(enabled)
+
+    def cuda_graph_stats(self):
+        return dict(enabled=self._cuda_graphs_enabled, captures=self._cuda_graph_captures,
+                    replays=self._cuda_graph_replays, fallbacks=self._cuda_graph_fallbacks,
+                    cached_graphs=self._cuda_graph_runner.capture_count if self._cuda_graph_runner else 0,
+                    last_error=self._cuda_graph_last_error)
+
+    def _cuda_graph_fallback(self, reason, signature):
+        if reason != self._cuda_graph_last_error:
+            warnings.warn(f"CUDA Graphs unavailable; using eager decode: {reason}", RuntimeWarning, stacklevel=3)
+        self._cuda_graph_runner = None
+        self._cuda_graph_signature = None
+        self._cuda_graph_failed_signature = signature
+        self._cuda_graph_last_error = reason
+        self._cuda_graph_fallbacks += 1
+
+    def _get_cuda_graph_runner(self, hidden, memory):
+        if hidden[0].device.type != "cuda":
+            self._cuda_graph_fallback("CUDA device required", None)
+            return None
+        if self._step_fn is not None:
+            self._cuda_graph_fallback("compiled step is active", None)
+            return None
+        generator = torch.cuda.default_generators[hidden[0].device.index]
+        if not all(hasattr(generator, name) for name in ("graphsafe_get_state", "graphsafe_set_state", "clone_state")):
+            self._cuda_graph_fallback("this PyTorch build lacks graph-safe RNG state management", None)
+            return None
+        hooks = torch.nn.modules.module
+        if (any(module._forward_hooks or module._forward_pre_hooks for module in self.modules())
+                or getattr(hooks, "_global_forward_hooks", None) or getattr(hooks, "_global_forward_pre_hooks", None)):
+            self._cuda_graph_fallback("Python forward hooks are active", None)
+            return None
+        signature = decode_signature(self, hidden, memory)
+        if signature == self._cuda_graph_failed_signature:
+            self._cuda_graph_fallbacks += 1
+            return None
+        try:
+            if signature != self._cuda_graph_signature:
+                self.clear_cuda_graph_cache()
+                self._cuda_graph_runner = CudaGraphDecode(self, hidden, memory)
+                self._cuda_graph_signature = signature
+            else:
+                self._cuda_graph_runner.reset(hidden, memory)
+            return self._cuda_graph_runner
+        except (RuntimeError, NotImplementedError) as exc:
+            self._cuda_graph_fallback(str(exc), signature)
+            return None
+
+    def train(self, mode=True):
+        lock = getattr(self, "_cuda_graph_lock", None)
+        with lock if lock is not None else nullcontext():
+            if mode and lock is not None:
+                self.clear_cuda_graph_cache()
+            return super().train(mode)
+
+    def _apply(self, fn, recurse=True):
+        lock = getattr(self, "_cuda_graph_lock", None)
+        with lock if lock is not None else nullcontext():
+            if lock is not None:
+                self.clear_cuda_graph_cache()
+            return super()._apply(fn, recurse=recurse)
 
     def set_sequence_batching(self, enabled: bool) -> None:
         """Opt into batching input projections/FFNs over time between layers.
@@ -241,6 +352,7 @@ class LiquidLanguageModel(nn.Module):
         Stochastic training and compiled-step execution retain the step schedule.
         """
         self._sequence_batching = bool(enabled)
+        self.clear_cuda_graph_cache()
 
     def _can_batch_sequence(self, seq_len: int) -> bool:
         if not self._sequence_batching or seq_len <= 1:
@@ -280,6 +392,7 @@ class LiquidLanguageModel(nn.Module):
         for cell in self.cells:
             cell.kernel = actual
         self._kernel = actual
+        self.clear_cuda_graph_cache()
         return actual
 
     def _reset_parameters(self) -> None:
@@ -306,8 +419,12 @@ class LiquidLanguageModel(nn.Module):
     def initial_hidden(self, batch_size: int, device: torch.device) -> list[torch.Tensor]:
         hidden = [
             self.h0[i].unsqueeze(0).expand(batch_size, -1).contiguous()
-            for i in range(self.num_layers)
+            for _ in range(self.recurrent_passes) for i in range(self.num_layers)
         ]
+        if self.recurrent_passes > 1:
+            # Pass-major layout: each depth pass has its own temporal state,
+            # while cell weights and learned initial states are shared.
+            hidden = [state.clone() for state in hidden]
         if self.innovation_memory is not None:
             hidden.append(self.innovation_memory.initial_state(batch_size, device))
         return hidden
@@ -322,6 +439,8 @@ class LiquidLanguageModel(nn.Module):
         gradient mode)."""
         if not hasattr(torch, "compile"):
             return False, None
+        if self._cuda_graphs_enabled:
+            raise ValueError("Disable CUDA Graphs before compiling the recurrent step")
         device = next(self.parameters()).device
         b = max(1, int(batch_size))
         x_t = torch.zeros(b, self.embedding_dim, device=device)
@@ -382,15 +501,17 @@ class LiquidLanguageModel(nn.Module):
         do_residual = self._do_residual
         use_ckpt = self.use_checkpoint and self.training
 
-        for i, cell in enumerate(self.cells):
+        for state_index in range(self.recurrent_state_count):
+            i = state_index % self.num_layers
+            cell = self.cells[i]
             w, b = fused[i]
             if use_ckpt:
                 h_new = cp.checkpoint(
                     cell,
-                    hidden[i], x_t,
+                    hidden[state_index], x_t,
                     dt=dt,
-                    xp=xp_t if i == 0 else None,
-                    tx=tx_t if i == 0 else None,
+                    xp=xp_t if state_index == 0 else None,
+                    tx=tx_t if state_index == 0 else None,
                     fused_w=w,
                     fused_b=b,
                     mix_w=mix_weights[i] if mix_weights is not None else None,
@@ -398,26 +519,27 @@ class LiquidLanguageModel(nn.Module):
                     use_reentrant=False,
                 )
             else:
-                if i == 0:
-                    h_new = cell(hidden[i], x_t, dt=dt, xp=xp_t, tx=tx_t, fused_w=w, fused_b=b,
+                if state_index == 0:
+                    h_new = cell(hidden[state_index], x_t, dt=dt, xp=xp_t, tx=tx_t, fused_w=w, fused_b=b,
                                  mix_w=mix_weights[i] if mix_weights is not None else None,
                                  input_projection=input_projections[i] if input_projections is not None else None)
                 else:
-                    h_new = cell(hidden[i], x_t, dt=dt, fused_w=w, fused_b=b,
+                    h_new = cell(hidden[state_index], x_t, dt=dt, fused_w=w, fused_b=b,
                                  mix_w=mix_weights[i] if mix_weights is not None else None,
                                  input_projection=input_projections[i] if input_projections is not None else None)
 
-            hidden[i] = h_new
+            hidden[state_index] = h_new
             if do_residual[i]:
                 x_t = x_t + h_new
             else:
                 x_t = h_new
-            if self.ffns is not None:
+            # Repeat the liquid mixers; execute each FFN on the final pass.
+            if self.ffns is not None and state_index >= self.recurrent_state_count - self.num_layers:
                 x_t = self.ffns[i](x_t)
 
         if self.innovation_memory is not None:
-            x_t, hidden[self.num_layers] = self.innovation_memory(
-                x_t, hidden[self.num_layers], dt=dt,
+            x_t, hidden[self.recurrent_state_count] = self.innovation_memory(
+                x_t, hidden[self.recurrent_state_count], dt=dt,
             )
         # Final normalization has no recurrent-state dependency. Batch it after
         # stacking time, or normalize only the final token during prompt prefill.
@@ -437,7 +559,7 @@ class LiquidLanguageModel(nn.Module):
             hidden = self.initial_hidden(batch_size, tokens.device)
         else:
             hidden = list(hidden)
-            state_count = self.num_layers + int(self.innovation_memory is not None)
+            state_count = self.recurrent_state_count + int(self.innovation_memory is not None)
             if len(hidden) > state_count:
                 conv_buf = hidden[state_count]
                 hidden = hidden[:state_count]
@@ -493,37 +615,39 @@ class LiquidLanguageModel(nn.Module):
         """
         hidden = list(hidden)
         length = x.size(1)
-        for index, cell in enumerate(self.cells):
-            xp, tx = cell.precompute_x(x, projections[index])
+        for index in range(self.recurrent_state_count):
+            layer = index % self.num_layers
+            cell = self.cells[layer]
+            xp, tx = cell.precompute_x(x, projections[layer])
             state = hidden[index]
             outputs = []
-            keep_sequence = index + 1 < self.num_layers or not last_token_only or self.innovation_memory is not None
+            keep_sequence = index + 1 < self.recurrent_state_count or not last_token_only or self.innovation_memory is not None
             for t in range(length):
                 if self.use_checkpoint and self.training:
                     state = cp.checkpoint(
                         cell, state, x[:, t], dt=dt, xp=xp[:, t], tx=tx[:, t],
-                        fused_w=fused[index][0], fused_b=fused[index][1], mix_w=mixes[index],
-                        input_projection=projections[index], use_reentrant=False,
+                        fused_w=fused[layer][0], fused_b=fused[layer][1], mix_w=mixes[layer],
+                        input_projection=projections[layer], use_reentrant=False,
                     )
                 else:
                     state = cell(
                         state, x[:, t], dt=dt, xp=xp[:, t], tx=tx[:, t],
-                        fused_w=fused[index][0], fused_b=fused[index][1], mix_w=mixes[index],
-                        input_projection=projections[index],
+                        fused_w=fused[layer][0], fused_b=fused[layer][1], mix_w=mixes[layer],
+                        input_projection=projections[layer],
                     )
                 if keep_sequence:
                     outputs.append(state)
             hidden[index] = state
             output = torch.stack(outputs, dim=1) if keep_sequence else state.unsqueeze(1)
-            if self._do_residual[index]:
+            if self._do_residual[layer]:
                 output = output + (x if keep_sequence else x[:, -1:])
-            if self.ffns is not None:
-                output = self.ffns[index](output)
+            if self.ffns is not None and index >= self.recurrent_state_count - self.num_layers:
+                output = self.ffns[layer](output)
             x = output
         if self.innovation_memory is not None:
             outputs = []
             for t in range(length):
-                output, hidden[self.num_layers] = self.innovation_memory(x[:, t], hidden[self.num_layers], dt=dt)
+                output, hidden[self.recurrent_state_count] = self.innovation_memory(x[:, t], hidden[self.recurrent_state_count], dt=dt)
                 if not last_token_only:
                     outputs.append(output)
             x = output.unsqueeze(1) if last_token_only else torch.stack(outputs, dim=1)
@@ -580,6 +704,7 @@ class LiquidLanguageModel(nn.Module):
         return logits
 
     @torch.inference_mode()
+    @serialize_graph_generation
     def generate(
         self,
         prompt: str,
@@ -630,6 +755,8 @@ class LiquidLanguageModel(nn.Module):
         generated_ids = list(prompt_ids)
         recent_tokens = _trim_recent_tokens(generated_ids, repetition_window)
         temperature = max(float(temperature), 1e-4)
+        runner = None
+        graph_attempted = False
 
         for step_i in range(max_new_tokens):
             logits = self._apply_repetition_penalty(
@@ -645,6 +772,26 @@ class LiquidLanguageModel(nn.Module):
             generated_ids.append(token_id)
             recent_tokens = _trim_recent_tokens(recent_tokens + [token_id], repetition_window)
             if step_i + 1 < max_new_tokens:
+                if self._cuda_graphs_enabled and not graph_attempted:
+                    runner = self._get_cuda_graph_runner(hidden, memory)
+                    graph_attempted = True
+                if runner is not None:
+                    previous_captures = runner.capture_count
+                    try:
+                        next_logits = runner.step(
+                            next_token,
+                            read_memory=use_chunk_memory and processed_tokens % memory_chunk_size == 0,
+                            write_memory=use_chunk_memory and (processed_tokens + 1) % memory_chunk_size == 0,
+                        )
+                    except CudaGraphUnavailable as exc:
+                        hidden, memory = runner.hidden, runner.memory
+                        self._cuda_graph_fallback(str(exc), self._cuda_graph_signature)
+                        runner = None
+                    else:
+                        self._cuda_graph_captures += runner.capture_count - previous_captures
+                        self._cuda_graph_replays += 1
+                        processed_tokens += 1
+                        continue
                 if use_chunk_memory:
                     if processed_tokens % memory_chunk_size == 0:
                         hidden = chunk_memory_read(self, hidden, memory)
@@ -671,7 +818,7 @@ ARCH_KEYS = (
     "dropout", "zoneout", "tie_weights", "mlp_head", "residual",
     "multi_tau", "local_conv", "gate_mode",
     "memory_slots", "memory_dim",
-    "ffn_mult", "norm_type", "innovation_memory_dim",
+    "ffn_mult", "norm_type", "innovation_memory_dim", "recurrent_passes",
 )
 
 
@@ -680,7 +827,7 @@ LEGACY_ARCH_DEFAULTS = {
     "residual": False, "multi_tau": False, "local_conv": False,
     "gate_mode": "ltc",
     "memory_slots": 0, "memory_dim": 0,
-    "ffn_mult": 0.0, "norm_type": "layer", "innovation_memory_dim": 0,
+    "ffn_mult": 0.0, "norm_type": "layer", "innovation_memory_dim": 0, "recurrent_passes": 1,
 }
 
 
@@ -725,6 +872,7 @@ def create_model_from_config(vocab_size, config, device):
         ffn_mult=float(_arch_value(config, "ffn_mult") or 0.0),
         norm_type="rms",
         innovation_memory_dim=int(_arch_value(config, "innovation_memory_dim") or 0),
+        recurrent_passes=_arch_value(config, "recurrent_passes"),
     ).to(device)
 
 
@@ -778,7 +926,8 @@ def save_checkpoint(
         "best_val": best_val,
         "tokenizer": tokenizer.to_config(),
         "corpus_sha256": corpus_sha256,
-        "config": {**vars(args), "norm_type": base_model.norm_type}
+        "config": {**vars(args), "norm_type": base_model.norm_type,
+                   "recurrent_passes": base_model.recurrent_passes}
                   if isinstance(base_model, LiquidLanguageModel) else dict(vars(args)),
     }
     # Replace only after a complete write, so an interrupted/failed save keeps

@@ -88,6 +88,10 @@ def build_parser():
     parser.add_argument("--embedding-dim", type=int, default=384)
     parser.add_argument("--hidden-size", type=int, default=384)
     parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--recurrent-passes", type=int, default=1,
+                        help="Shared liquid-mixer depth passes per token (default 1). "
+                             "Each pass has an independent temporal state; FFNs run on the final pass. "
+                             "Values above 1 require equal embedding and hidden widths. Saved in checkpoints.")
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--zoneout", type=float, default=0.1)
     parser.add_argument("--tie-weights", action=argparse.BooleanOptionalAction, default=True)
@@ -179,11 +183,15 @@ def build_parser():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--amp", type=str, choices=["auto", "fp16", "bf16", "off"], default="auto")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=False,
+                        help="Cache complete one-token CUDA inference graphs, including chunk memory. "
+                             "For generation/chat only; sampling stays eager. Incompatible with --compile. "
+                             "Unsupported captures fall back to eager decode.")
     parser.add_argument(
         "--compile-mode", type=str,
         choices=["default", "reduce-overhead", "max-autotune"],
         default="default",
-        help="reduce-overhead = CUDA Graphs (maximum speed); "
+        help="reduce-overhead requests compiler CUDA Graph optimizations; measure actual speed. "
              "max-autotune is NOT recommended for this model — tries "
              "dozens of gemm-kernel variants for a gain that these "
              "small matrices do not provide, and may take minutes on "
@@ -224,6 +232,8 @@ def build_parser():
 
 def validate_training_ranges(args) -> None:
     """Validate option ranges that otherwise cause silent or unstable behavior."""
+    if getattr(args, "recurrent_passes", 1) < 1:
+        raise ValueError("--recurrent-passes must be >= 1")
     if not math.isfinite(args.kd_alpha) or not 0.0 <= args.kd_alpha <= 1.0:
         raise ValueError("--kd-alpha must be between 0 and 1")
     if not math.isfinite(args.kd_temperature) or args.kd_temperature <= 0.0:
@@ -321,6 +331,10 @@ def validate_eval_batches(eval_batches: int) -> None:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.cuda_graphs and args.compile:
+        parser.error("--cuda-graphs and --compile are separate inference backends; choose one")
+    if args.cuda_graphs and not (args.generate_only or args.chat or args.chat_repl):
+        parser.error("--cuda-graphs is for --generate-only, --chat or --chat-repl")
     set_trust_checkpoints(args.trust_checkpoint)
 
     set_seed(args.seed)

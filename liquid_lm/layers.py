@@ -791,13 +791,14 @@ def chunk_memory_read(base_model, hidden, memory):
     if hidden is None:
         hidden = base_model.initial_hidden(memory.shape[0], memory.device)
     hidden = list(hidden)
-    last = base_model.num_layers - 1
+    last = getattr(base_model, "recurrent_state_count", base_model.num_layers) - 1
     hidden[last] = base_model.chunk_memory.read(hidden[last], memory)
     return hidden
 
 
 def chunk_memory_write(base_model, hidden, memory):
-    """Updates the buffer AFTER a subchunk is processed with the final hidden[-1]."""
+    """Store the final liquid stream after a subchunk, excluding side states."""
     if base_model.chunk_memory is None:
         return memory
-    return base_model.chunk_memory.write(hidden[base_model.num_layers - 1], memory)
+    last = getattr(base_model, "recurrent_state_count", base_model.num_layers) - 1
+    return base_model.chunk_memory.write(hidden[last], memory)
